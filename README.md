@@ -1,6 +1,6 @@
 # AtomFlow (AF) Engine
 
-High-performance LLM inference engine optimized for NVIDIA 50-series GPUs.
+High-performance LLM inference engine optimized for NVIDIA Blackwell GPUs.
 
 ## Design Philosophy
 - **Simple Infrastructure**: POD-based `View` system for zero-overhead tensor management.
