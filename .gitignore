@@ -1,0 +1,18 @@
+# compile files
+build/
+bin/
+*.o
+*.out
+*.exe
+
+# weight and data
+*.bin
+*.pt
+*.pth
+*.safetensors
+models/weights/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
