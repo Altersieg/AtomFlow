@@ -38,3 +38,10 @@ class ArenaAllocator {
         size_t offset_ = 0;
         size_t capacity_ = 0;
 };
+
+struct MemoryMap {
+    // for datetype modification in main.cpp
+    __nv_fp8_e4m3* weights;     
+    float* activations;         
+    __nv_fp8_e4m3* kv_cache;   
+};
