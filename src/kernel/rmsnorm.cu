@@ -3,7 +3,7 @@
 #include <cuda_fp8.h> 
 #include <cub/block/block_reduce.cuh>
 
-template <typename T, BLOCK_DIM>
+template <typename T, int BLOCK_DIM>
 __global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, float eps) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
@@ -66,13 +66,25 @@ __global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, flo
 }
 
 void launch_rms_norm(const View& input, const View& weight, View& output, float eps, cudaStream_t stream) {
+    
+    int32_t rows = calculate_rows(input);
+    int32_t cols = input.dims[input.num_dims - 1];
+    
+    constexpr int THREAD_PER_BLOCK = 128;
+
     switch (input.dtype) {
-        case DataType::FP16:
-            rms_norm_kernel<half><<<row, 128, 0, stream>>>(input, weight, output, eps);
+        case DataType::FP16: {
+            const half* in_ptr = static_cast<const half*>(input.data_ptr);
+            const half* wei_ptr = static_cast<const half*>(weight.data_ptr);
+            rms_norm_kernel<half><<<row, THREAD_PER_BLOCK, 0, stream>>>(input, weight, output, eps);
             break;
-        case DataType::FP8_E4M3:
-            rms_norm_kernel<<<row, 128, 0, stream>>>(input, weight, output, eps);
+        }
+        case DataType::FP8_E4M3: {
+            const __nv_fp8_e4m3* in_ptr = static_cast<const __nv_fp8_e4m3*>(input.data_ptr);
+            const __nv_fp8_e4m3* wei_ptr = static_cast<const __nv_fp8_e4m3*>(weight.data_ptr);
+            rms_norm_kernel<<<row, THREAD_PER_BLOCK, 0, stream>>>(input, weight, output, eps);
             break;
+        }
         default:
             throw std::runtime_error("Unsupported data type");
     }
