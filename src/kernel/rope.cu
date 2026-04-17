@@ -1,4 +1,4 @@
-#include "operators.h"
+#include "kernel.h"
 
 template<T>
 __global__ void rope_kernel( T* q_ptr,   // [1, Seq, h * q_num]

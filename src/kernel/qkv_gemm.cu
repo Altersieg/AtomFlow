@@ -1,6 +1,6 @@
 
 
-void lauch_qkv_gemmvoid lauch_qkv_gemm(
+void lauch_qkv_gemm(
     const View& input,    // [Total_Tokens, Hidden_Dim]
     const View& weight,   // [QKV_Total_Dim, Hidden_Dim] -> 预先拼接好的权重
     View& output,         // [Total_Tokens, QKV_Total_Dim]
@@ -26,5 +26,4 @@ void lauch_qkv_gemmvoid lauch_qkv_gemm(
         output.data_ptr(), CUDA_R_16F, n,      // 输出：FP16
         CUBA_COMPUTE_32F,                      // 内部用 FP32 累加保证精度
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);        // 强制调用 Tensor Core
-
 } 
