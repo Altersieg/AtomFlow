@@ -1,5 +1,5 @@
 struct AtomContext {
-    ModelConfig config;
+    ModelConfig config; //param
 
     MemoryPlanner planner;
     BlockManager block_manager;
