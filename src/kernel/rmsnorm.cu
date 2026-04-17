@@ -89,13 +89,3 @@ void launch_rms_norm(const View& input, const View& weight, View& output, float 
             throw std::runtime_error("Unsupported data type");
     }
 }
-
-inline int32_t calculate_rows(const View& view) {
-    if (view.num_dims < 2) return 1;
-
-    int32_t rows = 1;
-    for (int i = 0; i < view.num_dims - 1; ++i) { 
-        rows *= view.dims[i]; //row = B * S (Batch Size * Sequence Length)
-    }
-    return rows;
-}

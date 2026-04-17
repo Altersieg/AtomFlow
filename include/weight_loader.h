@@ -20,10 +20,10 @@ public:
             throw std::runtime_error("mmap failed");
         }
 
-        // 3. 关键提示：告诉 OS 我们要进行大规模顺序读取，预取数据
+        // 3. tell OS this is s massive read
         madvise(mapped_ptr, file_size, MADV_SEQUENTIAL);
 
-        close(fd); // 映射建立后，fd 即可关闭
+        close(fd);
     }
 
     ~WeightLoader() {
