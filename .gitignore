@@ -1,9 +1,12 @@
 # compile files
 build/
+build-*/
 bin/
 *.o
+*.obj
 *.out
 *.exe
+compile_commands.json
 
 # weight and data
 *.bin

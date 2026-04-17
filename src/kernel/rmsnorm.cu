@@ -1,7 +1,9 @@
-#include "kernel.h"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h> 
 #include <cub/block/block_reduce.cuh>
+#include <cublas_v2.h>
+#include "view.h"
+#include "kernel.h"
 
 template <typename T, int BLOCK_DIM>
 __global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, float eps) {
@@ -15,10 +17,10 @@ __global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, flo
 
     // --- 编译期分支：计算平方和 ---
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-        // FP8 特有的极速读取和转换逻辑
-        // 50 系显卡可以用更宽的读取指令
+        // FP8 path: __nv_fp8_e4m3 exposes an implicit conversion operator to float.
+        // (CUDA 12 no longer ships __fp8_to_half_raw / __half_to_fp8_rn.)
         for (int i = tid; i < cols; i += blockDim.x) {
-            float val = __half2float(__fp8_to_half_raw(row_in[i])); 
+            float val = static_cast<float>(row_in[i]);
             sum_sq += val * val;
         }
     } else {
@@ -51,10 +53,11 @@ __global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, flo
 
     // --- 编译期分支：写回结果 ---
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-        // 写回时转回 FP8
+        // FP8 writeback: construct __nv_fp8_e4m3 directly from float.
         for (int i = tid; i < cols; i += blockDim.x) {
-            float val = __half2float(__fp8_to_half_raw(row_in[i]));
-            row_out[i] = __half_to_fp8_rn( __float2half(val * s_variance * __half2float(__fp8_to_half_raw(wei[i]))));
+            float val = static_cast<float>(row_in[i]);
+            float w   = static_cast<float>(wei[i]);
+            row_out[i] = __nv_fp8_e4m3(val * s_variance * w);
         }
     } else {
         // FP16 路径
@@ -74,15 +77,19 @@ void launch_rms_norm(const View& input, const View& weight, View& output, float 
 
     switch (input.dtype) {
         case DataType::FP16: {
-            const half* in_ptr = static_cast<const half*>(input.data_ptr);
+            const half* in_ptr  = static_cast<const half*>(input.data_ptr);
             const half* wei_ptr = static_cast<const half*>(weight.data_ptr);
-            rms_norm_kernel<half><<<row, THREAD_PER_BLOCK, 0, stream>>>(input, weight, output, eps);
+            half*       out_ptr = static_cast<half*>(output.data_ptr);
+            rms_norm_kernel<half, THREAD_PER_BLOCK><<<rows, THREAD_PER_BLOCK, 0, stream>>>(
+                in_ptr, wei_ptr, out_ptr, cols, eps);
             break;
         }
         case DataType::FP8_E4M3: {
-            const __nv_fp8_e4m3* in_ptr = static_cast<const __nv_fp8_e4m3*>(input.data_ptr);
+            const __nv_fp8_e4m3* in_ptr  = static_cast<const __nv_fp8_e4m3*>(input.data_ptr);
             const __nv_fp8_e4m3* wei_ptr = static_cast<const __nv_fp8_e4m3*>(weight.data_ptr);
-            rms_norm_kernel<<<row, THREAD_PER_BLOCK, 0, stream>>>(input, weight, output, eps);
+            __nv_fp8_e4m3*       out_ptr = static_cast<__nv_fp8_e4m3*>(output.data_ptr);
+            rms_norm_kernel<__nv_fp8_e4m3, THREAD_PER_BLOCK><<<rows, THREAD_PER_BLOCK, 0, stream>>>(
+                in_ptr, wei_ptr, out_ptr, cols, eps);
             break;
         }
         default:

@@ -22,7 +22,7 @@ struct View {
     __device__ __host__ size_t offset(int d0, int d1, int d2, int d3) const { return d0 * strides[0] + d1 * strides[1] + d2 * strides[2] + d3 * strides[3]; }
 
     template<typename T>
-    __device__ __host__ T* const at_offset(size_t off) const { return static_cast<T*>(data_ptr) + off; }  
+    __device__ __host__ T* at_offset(size_t off) const { return static_cast<T*>(data_ptr) + off; }  
     template<typename T, typename... Args>
     __device__ __host__ T* at(Args... args) const { return at_offset<T>(offset(args...)); }
 };

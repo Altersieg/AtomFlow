@@ -1,4 +1,7 @@
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include "view.h"
+#include "kernel.h"
 
 // [EN] Optimized Attention Kernel utilizing Shared Memory for data reuse and coalesced loads.
 // [CN] 利用共享内存实现数据复用和合并加载的优化注意力核函数。

@@ -1,5 +1,8 @@
-#include <cuda_fp16.h>
 #include <math.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include "view.h"
+#include "kernel.h"
 
 // [EN] Element-wise SwiGLU activation: out = (gate * sigmoid(gate)) * up
 // [CN] 逐元素 SwiGLU 激活：out = (gate * sigmoid(gate)) * up
