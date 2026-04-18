@@ -1,4 +1,8 @@
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include "utils/utils.h"
+#include "core/view.h"
+#include "ops/kernel.h"
 
 // [EN] Naive Element-wise vector addition for Residual Connection.
 // [CN] 用于残差连接的朴素逐元素向量加法。
@@ -13,4 +17,18 @@ __global__ void residual_add_kernel_naive(const half* x_original, const half* x_
     float sub  = __half2float(x_sublayer_out[idx]);
     
     out[idx] = __float2half(orig + sub);
+}
+
+// Launcher / 启动器
+void launch_residual_add(View& inout, const View& sub, cudaStream_t stream) {
+    int size = 1;
+    for (int i = 0; i < inout.num_dims; ++i) size *= inout.dims[i];
+    constexpr int BLOCK = 256;
+    int grid = (size + BLOCK - 1) / BLOCK;
+    residual_add_kernel_naive<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const half*>(inout.data_ptr),
+        static_cast<const half*>(sub.data_ptr),
+        static_cast<half*>(inout.data_ptr),   // in-place: inout += sub
+        size);
+    CUDA_CHECK_LAST();
 }

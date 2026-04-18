@@ -1,4 +1,4 @@
-#include "view.h"
+#include "core/view.h"
 // [EN] A structure representing the logically split Q, K, and V views sharing the same physical memory.
 // [CN] 表示逻辑上分离但共享同一块物理内存的Q、K、V视图结构体。
 // [Bug/Imperfection: Hardcoded metadata instantiation. Does not dynamically support varying GQA (Grouped-Query Attention) ratios easily. 硬编码的元数据实例化。无法轻易动态支持不同的分组查询注意力(GQA)比例。]

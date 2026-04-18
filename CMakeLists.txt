@@ -71,7 +71,7 @@ endif()
 file(GLOB_RECURSE ATOMFLOW_SOURCES
     CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"  # includes profiler.cpp
 )
 
 add_executable(atomflow ${ATOMFLOW_SOURCES})

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "view.h"
+#include "core/view.h"
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 

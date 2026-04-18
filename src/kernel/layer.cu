@@ -1,8 +1,8 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <iostream>
-#include "view.h"
-#include "kernel.h"
+#include "core/view.h"
+#include "ops/kernel.h"
 
 // [EN] Stub for a single-layer Transformer forward pass.
 //      The body is currently disabled because the launch_* helpers are still

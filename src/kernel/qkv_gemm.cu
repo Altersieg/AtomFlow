@@ -1,7 +1,8 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
-#include "view.h"
-#include "kernel.h"
+#include "utils/utils.h"
+#include "core/view.h"
+#include "ops/kernel.h"
 
 // [EN] Universal Linear GEMM launcher (also used for QKV fused projection).
 // [CN] 通用 Linear/GEMM 启动器 (同时用于融合 QKV 投影)。
@@ -22,7 +23,7 @@ void launch_linear_gemm(
     const float alpha = 1.0f;
     const float beta  = 0.0f;
 
-    cublasGemmEx(handle,
+    CUBLAS_CHECK(cublasGemmEx(handle,
         CUBLAS_OP_N, CUBLAS_OP_T,                  // weight is transposed on the fly
         n, m, k,
         &alpha,
@@ -31,5 +32,5 @@ void launch_linear_gemm(
         &beta,
         output.data_ptr, CUDA_R_16F,    n,         // FP16 output
         CUBLAS_COMPUTE_32F,                        // FP32 accumulation for accuracy
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);            // force Tensor Core
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));           // force Tensor Core
 }

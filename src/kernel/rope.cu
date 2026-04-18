@@ -2,8 +2,9 @@
 #include <cuda_fp8.h>
 #include <cublas_v2.h>
 #include <stdexcept>
-#include "view.h"
-#include "kernel.h"
+#include "utils/utils.h"
+#include "core/view.h"
+#include "ops/kernel.h"
 
 // [EN] Rotary Position Embedding kernel. Rotates pairs (d, d+head_dim/2) in-place for Q and K.
 // [CN] 旋转位置编码核函数。就地旋转 Q 和 K 的 (d, d+head_dim/2) 对。
@@ -65,6 +66,7 @@ void launch_rope(
             rope_kernel<half><<<blocks_per_grid, threads_per_block, 0, stream>>>(
                 q_ptr, k_ptr, cos_cache, sin_cache,
                 seq_len, kv_head_num, q_head_num, head_dim);
+            CUDA_CHECK_LAST();
             break;
         }
         case DataType::FP8_E4M3: {
@@ -73,6 +75,7 @@ void launch_rope(
             rope_kernel<__nv_fp8_e4m3><<<blocks_per_grid, threads_per_block, 0, stream>>>(
                 q_ptr, k_ptr, cos_cache, sin_cache,
                 seq_len, kv_head_num, q_head_num, head_dim);
+            CUDA_CHECK_LAST();
             break;
         }
         default:

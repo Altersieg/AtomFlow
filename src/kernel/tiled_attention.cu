@@ -1,7 +1,8 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
-#include "view.h"
-#include "kernel.h"
+#include "utils/utils.h"
+#include "core/view.h"
+#include "ops/kernel.h"
 
 // [EN] Optimized Attention Kernel utilizing Shared Memory for data reuse and coalesced loads.
 // [CN] 利用共享内存实现数据复用和合并加载的优化注意力核函数。
@@ -42,3 +43,33 @@ __global__ void tiled_attention_kernel(
         __syncthreads(); // 等大家都算完，准备搬下一块 K
     }
 }
+
+// Explicit instantiation for half precision
+// half 精度的显式实例化
+template __global__ void tiled_attention_kernel<half>(
+    const half*, const half*, const half*, half*, int, int, int);
+
+// Launcher: wraps the grid/block configuration
+// 启动器：封装网格/线程块配置
+// [Bug/Imperfection: Grid maps one block per query token (blockIdx.x = token row).
+//  For seq_len=1 (decode) this launches only 1 block, leaving most SMs idle.
+//  In production, launch 1 warp per head using a 2D grid (token × head).
+//  网格将每个 block 映射到一个 query token。seq_len=1 时只启动 1 个 block，
+//  大多数 SM 空闲。生产环境应使用 2D 网格（token × head）每 head 启动一个 warp。]
+template <typename T>
+void launch_tiled_attention_kernel(
+    const T* q_base, const T* k_base, const T* v_base,
+    T* out,
+    int seq_len, int head_dim, int qkv_stride,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 128;
+    int grid = (seq_len + (BLOCK / 32) - 1) / (BLOCK / 32);
+    tiled_attention_kernel<T><<<grid, BLOCK, 0, stream>>>(
+        q_base, k_base, v_base, out, seq_len, head_dim, qkv_stride);
+    CUDA_CHECK_LAST();
+}
+
+// Explicit instantiation of launcher
+template void launch_tiled_attention_kernel<half>(
+    const half*, const half*, const half*, half*, int, int, int, cudaStream_t);

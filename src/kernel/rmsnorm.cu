@@ -2,8 +2,9 @@
 #include <cuda_fp8.h> 
 #include <cub/block/block_reduce.cuh>
 #include <cublas_v2.h>
-#include "view.h"
-#include "kernel.h"
+#include "utils/utils.h"
+#include "core/view.h"
+#include "ops/kernel.h"
 
 template <typename T, int BLOCK_DIM>
 __global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, float eps) {
@@ -82,6 +83,7 @@ void launch_rms_norm(const View& input, const View& weight, View& output, float 
             half*       out_ptr = static_cast<half*>(output.data_ptr);
             rms_norm_kernel<half, THREAD_PER_BLOCK><<<rows, THREAD_PER_BLOCK, 0, stream>>>(
                 in_ptr, wei_ptr, out_ptr, cols, eps);
+            CUDA_CHECK_LAST();
             break;
         }
         case DataType::FP8_E4M3: {
@@ -90,6 +92,7 @@ void launch_rms_norm(const View& input, const View& weight, View& output, float 
             __nv_fp8_e4m3*       out_ptr = static_cast<__nv_fp8_e4m3*>(output.data_ptr);
             rms_norm_kernel<__nv_fp8_e4m3, THREAD_PER_BLOCK><<<rows, THREAD_PER_BLOCK, 0, stream>>>(
                 in_ptr, wei_ptr, out_ptr, cols, eps);
+            CUDA_CHECK_LAST();
             break;
         }
         default:
