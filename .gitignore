@@ -19,3 +19,12 @@ models/weights/
 .vscode/
 .idea/
 .DS_Store
+
+# profiling
+*.nsys-rep
+*.qdstrm
+*.sqlite
+*.sqlite3
+nsys-*
+*.nsys
+report*

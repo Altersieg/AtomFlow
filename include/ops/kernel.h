@@ -165,3 +165,30 @@ void launch_argmax(
     int* out_token_id,  // Device pointer for the single integer result
     cudaStream_t stream
 );
+
+// ----------------------------------------------------------------------------
+// 6. 辅助函数 (Helper Utilities)
+// ----------------------------------------------------------------------------
+
+// [EN] Embed lookup on GPU: read row `token_id` from FP32 table → FP16 dst.
+// [CN] GPU 端嵌入查找：从 FP32 表中读取 token_id 行 → FP16 dst。
+void launch_embed_lookup(const float* table, int token_id,
+                         half* dst, int D, cudaStream_t stream);
+
+// [EN] Element-wise FP16 → FP32 cast on GPU.
+// [CN] GPU 端逐元素 FP16 → FP32 转换。
+void launch_cast_fp16_to_fp32(const half* src, float* dst, int n,
+                              cudaStream_t stream);
+
+// [EN] Load a raw FP32 binary file from disk, convert to FP16, upload to GPU.
+//      Returns number of elements loaded, or 0 on failure.
+// [CN] 从磁盘读取 FP32 二进制文件，转为 FP16 后上传到 GPU。
+//      返回已加载的元素数；失败返回 0。
+size_t load_fp32_bin_to_fp16_device(const char* path, void* d_dst,
+                                    int expected_numel);
+
+// [EN] Precompute RoPE sin/cos cache and upload to GPU.
+// [CN] 预计算 RoPE sin/cos 缓存并上传到 GPU。
+void build_rope_cache(float* d_cos, float* d_sin,
+                      int max_seq, int head_dim, float base,
+                      cudaStream_t stream);
