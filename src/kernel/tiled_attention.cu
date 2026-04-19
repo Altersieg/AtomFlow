@@ -4,72 +4,158 @@
 #include "core/view.h"
 #include "ops/kernel.h"
 
-// [EN] Optimized Attention Kernel utilizing Shared Memory for data reuse and coalesced loads.
-// [CN] 利用共享内存实现数据复用和合并加载的优化注意力核函数。
-// [Bug/Imperfection: Still does not fully implement FlashAttention's tiling over the sequence dimension, risking Smem overflow for very long sequences. 仍未完全实现FlashAttention在序列维度上的分块，对于超长序列存在Smem溢出的风险。]
+// ============================================================================
+// gqa_attention_kernel — Correct GQA Softmax Attention
+//
+// Design: one thread per (output element) = (query_head, head_dim_index).
+//   Grid : dim3(n_q_heads * seq_q)    — one block per (token, query head)
+//   Block: head_dim                   — one thread per dimension
+//
+// For seq_kv == 1 (single-token decode step):
+//   softmax of exactly one score is always 1.0 regardless of the score value,
+//   so the attention output is simply out[h,d] = V[kv_head, d].
+//   This path is exact and introduces zero error.
+//
+// For seq_kv > 1:
+//   Uses shared memory for reduction of the Q·K dot product across head_dim
+//   threads, then online softmax, then weighted V accumulation.
+//   This is not flash-attention (no sequence-dimension tiling), so shared
+//   memory usage grows with seq_kv — sufficient for short sequences.
+//
+// [Bug/Imperfection: seq_kv > 1 path uses per-thread O(seq_kv) shared memory
+//  allocated dynamically. For very long sequences this exceeds the 48 KB Smem
+//  limit. A proper production kernel would tile over the KV sequence dimension
+//  (FlashAttention-style). The current implementation is correct for validation
+//  with seq_kv=1 and serves as a reference for future optimization.
+//  seq_kv > 1 路径动态分配 O(seq_kv) 共享内存。对于超长序列，这会超过 48 KB
+//  上限。生产内核应在 KV 序列维度上分块（FlashAttention 风格）。当前实现
+//  在 seq_kv=1 的验证场景下完全正确，可作为后续优化的参考基线。]
+// ============================================================================
 template <typename T>
-__global__ void tiled_attention_kernel(
-    const T* q_base, const T* k_base, const T* v_base, 
-    T* out, 
-    int seq_len, int head_dim, 
-    int qkv_stride) 
+__global__ void gqa_attention_kernel(
+    const T* __restrict__ q,     // [seq_q,  n_q_heads  * head_dim]
+    const T* __restrict__ k,     // [seq_kv, n_kv_heads * head_dim]
+    const T* __restrict__ v,     // [seq_kv, n_kv_heads * head_dim]
+    T* __restrict__ out,         // [seq_q,  n_q_heads  * head_dim]
+    int seq_q, int seq_kv,
+    int head_dim, int n_q_heads, int n_kv_heads)
 {
-    // [EN] Cooperative fetching: A Block of threads loads a Tile of K into Shared Memory.
-    // [CN] 协作预取：一个线程块将K的一个分块加载到共享内存中。
-    // [Bug/Imperfection: Hardcoded tile size (TILE_SIZE). If sequence length is not a multiple of TILE_SIZE, boundary checks are required but missing here. 硬编码的分块大小(TILE_SIZE)。如果序列长度不是TILE_SIZE的倍数，需要边界检查，但此处缺失。]
-    constexpr int TILE_SIZE = 128;
-    __shared__ T k_smem[TILE_SIZE][128]; // 假设 head_dim = 128
+    // blockIdx.x = linear index over (seq_q × n_q_heads)
+    // threadIdx.x = head dimension index d
+    int blk = blockIdx.x;
+    int d   = threadIdx.x;
 
-    // 此时，行映射逻辑改变。假设一个 Warp (32 线程) 负责处理 1 个 Token。
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int row = blockIdx.x * (blockDim.x / 32) + warp_id; 
+    int q_tok = blk / n_q_heads;
+    int h     = blk % n_q_heads;
 
-    if (row >= seq_len) return;
+    if (q_tok >= seq_q || h >= n_q_heads || d >= head_dim) return;
 
-    // ... (在外部循环中遍历 K 的所有 Tile) ...
-    for(int t_idx = 0; t_idx < seq_len; t_idx += TILE_SIZE) {
-        
-        // 1. 全体线程协作，把 TILE_SIZE 个 K 从 HBM 搬到 k_smem (实现合并访存)
-        // 每个线程搬运几个元素，而不是一个人搬运全部
-        // ... (搬运代码) ...
-        
-        __syncthreads(); // 物理屏障：等大家把这块 K 都搬完
+    const int Q_dim  = n_q_heads  * head_dim;
+    const int KV_dim = n_kv_heads * head_dim;
+    int kv_h = h * n_kv_heads / n_q_heads;   // GQA: share KV heads
 
-        // 2. 数据复用：现在所有的 Warp 都可以去读极速的 k_smem 了
-        // 而且每个 Warp 内的 32 个线程，可以并行去算 Q * K^T 的点积（每个人算 4 个维度的乘加）
-        // ... (Warp 级规约求和) ...
-
-        __syncthreads(); // 等大家都算完，准备搬下一块 K
+    // ── Fast path: seq_kv == 1 ───────────────────────────────────────────
+    // softmax([x]) = 1.0 for any x.  attn_out = V[kv_h, d].
+    // softmax([x]) = 1.0，无论 x 为何值。attn_out = V[kv_h, d]。
+    if (seq_kv == 1) {
+        out[q_tok * Q_dim + h * head_dim + d] = v[kv_h * head_dim + d];
+        return;
     }
+
+    // ── General path: seq_kv > 1 ────────────────────────────────────────
+    // Shared memory layout:
+    //   [0 .. head_dim)   — partial dot product reduction buffer
+    //   [head_dim .. head_dim + seq_kv) — accumulated softmax scores
+    //
+    // 共享内存布局：
+    //   [0 .. head_dim)           — 点积规约缓冲区
+    //   [head_dim .. head_dim + seq_kv) — softmax score 累积
+    extern __shared__ float smem[];
+    float* s_partial = smem;               // length head_dim
+    float* s_scores  = smem + head_dim;    // length seq_kv
+
+    const T* Q_h = q + q_tok * Q_dim + h * head_dim;
+    float inv_sqrt_hd = rsqrtf(static_cast<float>(head_dim));
+
+    // ── 1. Compute score for each key token (causal: s <= q_tok) ────────
+    // 按因果掩码计算每个 key token 的 attention score（s <= q_tok）
+    for (int s = 0; s <= q_tok && s < seq_kv; ++s) {
+        const T* K_s = k + s * KV_dim + kv_h * head_dim;
+
+        // Thread d contributes Q[d]*K[s][d] to the dot product
+        // 线程 d 贡献点积中的 Q[d]*K[s][d] 项
+        s_partial[d] = __half2float(Q_h[d]) * __half2float(K_s[d]);
+        __syncthreads();
+
+        // Thread 0 reduces and stores the score
+        // 线程 0 规约并存储 score
+        if (d == 0) {
+            float score = 0.0f;
+            for (int i = 0; i < head_dim; ++i) score += s_partial[i];
+            s_scores[s] = score * inv_sqrt_hd;
+        }
+        __syncthreads();
+    }
+
+    // ── 2. Online softmax (max + normalize) — computed by thread 0 ──────
+    // 在线 softmax（最大值 + 归一化）— 由线程 0 计算
+    if (d == 0) {
+        int n_keys = min(q_tok + 1, seq_kv);
+        float score_max = -1e38f;
+        for (int s = 0; s < n_keys; ++s)
+            score_max = fmaxf(score_max, s_scores[s]);
+        float sum_exp = 0.0f;
+        for (int s = 0; s < n_keys; ++s) {
+            s_scores[s] = expf(s_scores[s] - score_max);
+            sum_exp += s_scores[s];
+        }
+        // Normalize in-place
+        // 原地归一化
+        for (int s = 0; s < n_keys; ++s) s_scores[s] /= sum_exp;
+        // Zero-fill masked positions so thread d's accumulation is clean
+        // 将掩码位置清零，使线程 d 的累加结果干净
+        for (int s = n_keys; s < seq_kv; ++s) s_scores[s] = 0.0f;
+    }
+    __syncthreads();
+
+    // ── 3. Weighted sum of V across key tokens ───────────────────────────
+    // 对 key token 的 V 进行加权求和
+    float acc = 0.0f;
+    int n_keys = min(q_tok + 1, seq_kv);
+    for (int s = 0; s < n_keys; ++s) {
+        const T* V_s = v + s * KV_dim + kv_h * head_dim;
+        acc += s_scores[s] * __half2float(V_s[d]);
+    }
+    out[q_tok * Q_dim + h * head_dim + d] = __float2half(acc);
 }
 
-// Explicit instantiation for half precision
-// half 精度的显式实例化
-template __global__ void tiled_attention_kernel<half>(
-    const half*, const half*, const half*, half*, int, int, int);
-
-// Launcher: wraps the grid/block configuration
-// 启动器：封装网格/线程块配置
-// [Bug/Imperfection: Grid maps one block per query token (blockIdx.x = token row).
-//  For seq_len=1 (decode) this launches only 1 block, leaving most SMs idle.
-//  In production, launch 1 warp per head using a 2D grid (token × head).
-//  网格将每个 block 映射到一个 query token。seq_len=1 时只启动 1 个 block，
-//  大多数 SM 空闲。生产环境应使用 2D 网格（token × head）每 head 启动一个 warp。]
+// ============================================================================
+// Launcher
+// ============================================================================
 template <typename T>
 void launch_tiled_attention_kernel(
     const T* q_base, const T* k_base, const T* v_base,
     T* out,
-    int seq_len, int head_dim, int qkv_stride,
+    int seq_q, int seq_kv, int head_dim, int n_q_heads, int n_kv_heads,
     cudaStream_t stream)
 {
-    constexpr int BLOCK = 128;
-    int grid = (seq_len + (BLOCK / 32) - 1) / (BLOCK / 32);
-    tiled_attention_kernel<T><<<grid, BLOCK, 0, stream>>>(
-        q_base, k_base, v_base, out, seq_len, head_dim, qkv_stride);
+    int total_blocks = n_q_heads * seq_q;
+    int block_size   = head_dim;
+
+    // Shared memory: head_dim floats (reduction) + seq_kv floats (scores)
+    // 共享内存：head_dim 个 float（规约）+ seq_kv 个 float（score）
+    size_t smem_bytes = (seq_kv == 1)
+        ? 0
+        : static_cast<size_t>(head_dim + seq_kv) * sizeof(float);
+
+    gqa_attention_kernel<T><<<total_blocks, block_size, smem_bytes, stream>>>(
+        q_base, k_base, v_base, out,
+        seq_q, seq_kv, head_dim, n_q_heads, n_kv_heads);
     CUDA_CHECK_LAST();
 }
 
-// Explicit instantiation of launcher
+// Explicit instantiation of launcher for FP16
+// 为 FP16 显式实例化启动器
 template void launch_tiled_attention_kernel<half>(
-    const half*, const half*, const half*, half*, int, int, int, cudaStream_t);
+    const half*, const half*, const half*, half*,
+    int, int, int, int, int, cudaStream_t);

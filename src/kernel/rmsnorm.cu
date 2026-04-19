@@ -7,7 +7,7 @@
 #include "ops/kernel.h"
 
 template <typename T, int BLOCK_DIM>
-__global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, float eps) {
+__global__ void rms_norm_kernel(const T* in, const float* wei, T* out, int cols, float eps) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
 
@@ -57,14 +57,14 @@ __global__ void rms_norm_kernel(const T* in, const T* wei, T* out, int cols, flo
         // FP8 writeback: construct __nv_fp8_e4m3 directly from float.
         for (int i = tid; i < cols; i += blockDim.x) {
             float val = static_cast<float>(row_in[i]);
-            float w   = static_cast<float>(wei[i]);
+            float w   = wei[i];  // wei is now const float* — no cast needed
             row_out[i] = __nv_fp8_e4m3(val * s_variance * w);
         }
     } else {
         // FP16 路径
         for (int i = tid; i < cols; i += blockDim.x) {
             float val = __half2float(row_in[i]);
-            row_out[i] = __float2half(val * s_variance * __half2float(wei[i]));
+            row_out[i] = __float2half(val * s_variance * wei[i]);  // wei[i] already float
         }
     }
 }
@@ -78,9 +78,9 @@ void launch_rms_norm(const View& input, const View& weight, View& output, float 
 
     switch (input.dtype) {
         case DataType::FP16: {
-            const half* in_ptr  = static_cast<const half*>(input.data_ptr);
-            const half* wei_ptr = static_cast<const half*>(weight.data_ptr);
-            half*       out_ptr = static_cast<half*>(output.data_ptr);
+            const half*  in_ptr  = static_cast<const half*>(input.data_ptr);
+            const float* wei_ptr = static_cast<const float*>(weight.data_ptr);  // FP32 norm weights
+            half*        out_ptr = static_cast<half*>(output.data_ptr);
             rms_norm_kernel<half, THREAD_PER_BLOCK><<<rows, THREAD_PER_BLOCK, 0, stream>>>(
                 in_ptr, wei_ptr, out_ptr, cols, eps);
             CUDA_CHECK_LAST();
@@ -88,7 +88,7 @@ void launch_rms_norm(const View& input, const View& weight, View& output, float 
         }
         case DataType::FP8_E4M3: {
             const __nv_fp8_e4m3* in_ptr  = static_cast<const __nv_fp8_e4m3*>(input.data_ptr);
-            const __nv_fp8_e4m3* wei_ptr = static_cast<const __nv_fp8_e4m3*>(weight.data_ptr);
+            const float*         wei_ptr = static_cast<const float*>(weight.data_ptr);  // FP32 norm weights
             __nv_fp8_e4m3*       out_ptr = static_cast<__nv_fp8_e4m3*>(output.data_ptr);
             rms_norm_kernel<__nv_fp8_e4m3, THREAD_PER_BLOCK><<<rows, THREAD_PER_BLOCK, 0, stream>>>(
                 in_ptr, wei_ptr, out_ptr, cols, eps);

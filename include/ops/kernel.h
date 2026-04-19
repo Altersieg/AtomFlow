@@ -66,15 +66,23 @@ void launch_linear_gemm(
 // [CN] Tiled Attention 核函数启动器。添加了模板声明以符合 C++ 规范。
 // [Bug/Imperfection: Exposing raw pointers here breaks the View abstraction layer. It tightly couples the caller to physical memory addresses instead of logical tensors.
 // 在这里暴露裸指针破坏了 View 抽象层。它将调用者与物理内存地址紧密耦合，而不是逻辑张量。]
+// [EN] GQA attention kernel. For seq_kv=1 (decode): softmax of one score = 1.0,
+//      so out[h] = V[kv_head] (trivially exact). General seq_kv > 1 not yet
+//      implemented (outputs zero); extend when KV-cache is added.
+// [CN] GQA 注意力核函数。seq_kv=1（解码）时：单值 softmax = 1.0，
+//      故 out[h] = V[kv_head]（精确无误）。seq_kv > 1 通用路径尚未实现
+//      （输出零）；添加 KV 缓存后再扩展。
 template <typename T>
 void launch_tiled_attention_kernel(
-    const T* q_base, 
-    const T* k_base, 
-    const T* v_base, 
-    T* out, 
-    int seq_len, 
-    int head_dim, 
-    int qkv_stride,
+    const T* q_base,       // [seq_q, n_q_heads  * head_dim]
+    const T* k_base,       // [seq_kv, n_kv_heads * head_dim]
+    const T* v_base,       // [seq_kv, n_kv_heads * head_dim]
+    T* out,                // [seq_q, n_q_heads  * head_dim]
+    int seq_q,             // number of query tokens (= 1 for decode)
+    int seq_kv,            // number of key-value tokens (= seq_q for self-attn)
+    int head_dim,          // head dimension (= 128 for Llama 3.2 3B)
+    int n_q_heads,         // number of query heads (= 24)
+    int n_kv_heads,        // number of key-value heads for GQA (= 8)
     cudaStream_t stream
 );
 
@@ -100,6 +108,47 @@ void launch_swiglu(
 void launch_residual_add(
     View& inout_tensor,       // 作为输入，同时也是输出，直接覆写
     const View& sublayer_tensor, 
+    cudaStream_t stream
+);
+
+// ----------------------------------------------------------------------------
+// 4b. FP8 Dequantization + FP16×FP16 GEMM
+// ----------------------------------------------------------------------------
+
+// [EN] Dequantize a packed FP8-E4M3 weight tensor to FP16 using per-group
+//      FP16 scales (group_size elements share one scale).
+// [CN] 使用逐组 FP16 scale（group_size 个元素共享一个 scale）
+//      将 FP8-E4M3 权重张量反量化为 FP16。
+void launch_dequantize_fp8_to_fp16(
+    const View& weight,      // FP8_E4M3 [rows, cols]
+    const View& scales,      // FP16 [rows, cols/group_size]
+    View&       dst,         // FP16 [rows, cols]  pre-allocated workspace
+    int         group_size,
+    cudaStream_t stream
+);
+
+// [EN] Fused W8A16 GEMV — dequantize FP8 weights and compute dot-product in one
+//      kernel, with ZERO intermediate global-memory writes. For M=1 decode only.
+// [CN] 融合 W8A16 GEMV — 在单个 kernel 内完成 FP8 反量化和内积计算，
+//      零中间全局显存写回。仅用于 M=1 解码阶段。
+void launch_w8a16_gemv(
+    const View& act_x,       // FP16 [1, K]
+    const View& weight,      // FP8  [N, K]
+    const View& scales,      // FP16 [N, K/GS]
+    View&       output,      // FP16 [1, N]
+    int         group_size,  // 128
+    cudaStream_t stream
+);
+
+// [EN] FP16×FP16 → FP16 GEMM with FP32 accumulation.
+//      Same matrix layout as launch_linear_gemm; use after dequantizing weights.
+// [CN] FP16×FP16 → FP16 GEMM（FP32 累加）。
+//      矩阵布局与 launch_linear_gemm 相同；在反量化权重后使用。
+void launch_fp16x16_gemm(
+    const View& input,       // [Total_Tokens, In_Features]
+    const View& weight,      // [Out_Features, In_Features]  FP16 (dequantized)
+    View& output,            // [Total_Tokens, Out_Features]
+    cublasHandle_t handle,
     cudaStream_t stream
 );
 
