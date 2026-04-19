@@ -52,6 +52,5 @@ struct ActBuffers {
     View ffn_out;       // FP16 [1, D]        o_proj output; reused for down_proj output
     View logits;        // FP32 [1, V]
     View dequant_ws;    // FP16 [FFN, D]      workspace for FP8→FP16 dequantized weights
-    float* x_norm_fp32; // FP32 [D]           cast of x_norm before FP32 lm_head GEMM
     int*   d_token_id;  // INT32 [1]
 };

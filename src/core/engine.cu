@@ -16,6 +16,7 @@
 AtomFlowEngine::~AtomFlowEngine() {
     if (d_weight_pool_) cudaFree(d_weight_pool_);
     if (d_act_pool_)    cudaFree(d_act_pool_);
+    if (d_cublas_ws_)   cudaFree(d_cublas_ws_);
     if (stream_)        cudaStreamDestroy(stream_);
     if (cublas_)        cublasDestroy(cublas_);
 }
@@ -57,6 +58,7 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
         return (size_t)r * (c / GS) * sizeof(uint16_t);
     };
     auto fp32_sz  = [](int n) -> size_t { return (size_t)n * sizeof(float); };
+    auto fp16_sz  = [](int n) -> size_t { return (size_t)n * sizeof(half); };
 
     size_t pool_sz = 0;
     pool_sz += fp32_sz(V) * D;                          // embed_tokens
@@ -74,7 +76,7 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
         pool_sz += scale_sz(D, FFN);                    // down scales
     }
     pool_sz += fp32_sz(D);                              // model.norm
-    pool_sz += fp32_sz(V) * D;                          // lm_head
+    pool_sz += fp16_sz(V) * D;                          // lm_head (FP16)
     pool_sz += pool_sz / 16;                            // 6% headroom
 
     CUDA_CHECK(cudaMalloc(&d_weight_pool_, pool_sz));
@@ -138,8 +140,10 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
     // ---- Final norm + lm_head ----
     final_norm_v_ = copy_view(loader.next<float>(D),
                                fp32_sz(D), DataType::FP32, {D});
-    lm_head_v_ = copy_view(loader.next<float>((size_t)V * D),
-                            fp32_sz(V) * D, DataType::FP32, {V, D});
+    // [EN] lm_head stored as FP16 — halves VRAM; cublasGemmEx does FP16-in/FP32-out.
+    // [CN] lm_head 以 FP16 存储 — 显存减半；cublasGemmEx 实现 FP16 输入 / FP32 输出。
+    lm_head_v_ = copy_view(loader.next<uint16_t>((size_t)V * D),
+                            fp16_sz(V) * D, DataType::FP16, {V, D});
 
     std::printf("[All weights uploaded]  pool used: %.2f GiB\n",
                 (double)(d_cur - (uint8_t*)d_weight_pool_) / (1 << 30));
@@ -151,7 +155,6 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
     act_sz += SEQ * FFN          * sizeof(half)  * 2;  // gate_out, up_out
     act_sz += SEQ * D            * sizeof(half);        // ffn_out
     act_sz += (size_t)FFN * D   * sizeof(half);        // dequant_ws
-    act_sz += SEQ * D            * sizeof(float);       // x_norm_fp32
     act_sz += SEQ * V            * sizeof(float);       // logits FP32
     act_sz += sizeof(int);                              // token_id
     act_sz += 2 * HD             * sizeof(float);       // rope cos/sin
@@ -175,7 +178,6 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
     act_.up_out     = mk(SEQ*FFN    *sizeof(half),  DataType::FP16, {(int)SEQ, FFN});
     act_.ffn_out    = mk(SEQ*D          *sizeof(half),  DataType::FP16, {(int)SEQ, D});
     act_.dequant_ws = mk((size_t)FFN*D  *sizeof(half),  DataType::FP16, {FFN, D});
-    act_.x_norm_fp32= reinterpret_cast<float*>(a); a += SEQ*D*sizeof(float);
     act_.logits     = mk(SEQ*V      *sizeof(float), DataType::FP32, {(int)SEQ, V});
     act_.d_token_id = reinterpret_cast<int*>(a);   a += sizeof(int);
     d_cos_          = reinterpret_cast<float*>(a); a += HD * sizeof(float);
@@ -185,6 +187,15 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
     CUBLAS_CHECK(cublasCreate(&cublas_));
     CUDA_CHECK(cudaStreamCreate(&stream_));
     CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
+
+    // Pre-allocate a cuBLAS workspace so that cuBLAS never calls cudaMalloc
+    // during stream capture (which would be illegal). 4 MiB is sufficient
+    // for all GEMM shapes used in Llama 3.2 3B.
+    // 预分配 cuBLAS 工作区，使 cuBLAS 在流捕获期间不再调用 cudaMalloc
+    // （否则将非法）。4 MiB 足够 Llama 3.2 3B 的所有 GEMM 形状。
+    static constexpr size_t CUBLAS_WS_SIZE = 4 * 1024 * 1024;  // 4 MiB
+    CUDA_CHECK(cudaMalloc(&d_cublas_ws_, CUBLAS_WS_SIZE));
+    CUBLAS_CHECK(cublasSetWorkspace(cublas_, d_cublas_ws_, CUBLAS_WS_SIZE));
 
     build_rope_cache(d_cos_, d_sin_, /*max_seq=*/1, HD, /*base=*/500000.0f, stream_);
 }
@@ -209,6 +220,18 @@ void AtomFlowEngine::inject_input(const char* gt_embed_path, bool verbose) {
             static_cast<half*>(act_.x.data_ptr),
             D, stream_);
     }
+}
+
+// ============================================================================
+// inject_token — embed lookup on GPU for autoregressive decode
+// inject_token — GPU 端嵌入查找，用于自回归解码
+// ============================================================================
+void AtomFlowEngine::inject_token(int token_id) {
+    launch_embed_lookup(
+        static_cast<const float*>(embed_v_.data_ptr),
+        token_id,
+        static_cast<half*>(act_.x.data_ptr),
+        D, stream_);
 }
 
 // ============================================================================
@@ -418,19 +441,21 @@ void AtomFlowEngine::forward_pass() {
 #if ENABLE_PROFILER
         auto _t = prof_.scoped_device("lm_head", stream_);
 #endif
-        launch_cast_fp16_to_fp32(
-            static_cast<const half*>(act_.x_norm.data_ptr),
-            act_.x_norm_fp32, D, stream_);
-
+        // [EN] cublasGemmEx: FP16 inputs (lm_head + x_norm), FP32 output (logits).
+        //      Eliminates the FP16→FP32 cast kernel and halves lm_head VRAM.
+        // [CN] cublasGemmEx：FP16 输入（lm_head + x_norm），FP32 输出（logits）。
+        //      消除 FP16→FP32 转换 kernel，lm_head 显存减半。
         float alpha = 1.0f, beta = 0.0f;
-        CUBLAS_CHECK(cublasSgemm(cublas_,
+        CUBLAS_CHECK(cublasGemmEx(cublas_,
             CUBLAS_OP_T, CUBLAS_OP_N,
             V, 1, D,
             &alpha,
-            static_cast<const float*>(lm_head_v_.data_ptr), D,
-            act_.x_norm_fp32, D,
+            lm_head_v_.data_ptr, CUDA_R_16F, D,
+            act_.x_norm.data_ptr, CUDA_R_16F, D,
             &beta,
-            static_cast<float*>(act_.logits.data_ptr), V));
+            act_.logits.data_ptr, CUDA_R_32F, V,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT));
     }
 #if ENABLE_PROFILER
     prof_.mark_decode_end(stream_);

@@ -293,6 +293,12 @@ def _write_tensor_fp32(f, tensor: torch.Tensor) -> None:
     _write_padded(f, tensor.detach().float().cpu().numpy().tobytes())
 
 
+def _write_tensor_fp16(f, tensor: torch.Tensor) -> None:
+    """Write a tensor as raw FP16 with 256-byte alignment.
+    以 FP16 格式写入张量，附 256 字节对齐填充。"""
+    _write_padded(f, tensor.detach().to(torch.float16).cpu().numpy().tobytes())
+
+
 def _write_tensor_fp8(f, tensor: torch.Tensor) -> None:
     """
     Quantize tensor to FP8 GS=128, then write:
@@ -327,7 +333,7 @@ def export_atomflow(hf_model, filepath: str) -> None:
         [up_proj_weight   — FP8 + FP16 scales]
         [down_proj_weight — FP8 + FP16 scales]
       [model.norm — FP32, padded]
-      [lm_head    — FP32, padded]
+      [lm_head    — FP16, padded]
 
     将经过 AWQ 平滑的 Llama 3.2 模型导出为 AtomFlow 二进制格式。
     """
@@ -406,14 +412,16 @@ def export_atomflow(hf_model, filepath: str) -> None:
         print("Writing output layers / 写入输出层...")
         _write_tensor_fp32(f, sd["model.norm.weight"])
 
-        # lm_head may be weight-tied to embed_tokens
-        # lm_head 可能与 embed_tokens 共享权重
+        # lm_head may be weight-tied to embed_tokens — export as FP16 to halve
+        # VRAM and enable cublasGemmEx FP16-in / FP32-out in the C++ engine.
+        # lm_head 可能与 embed_tokens 共享权重 — 导出为 FP16 以减半显存占用，
+        # 并在 C++ 引擎中启用 cublasGemmEx FP16 输入 / FP32 输出。
         lm_src = (
             sd["lm_head.weight"]
             if "lm_head.weight" in sd
             else sd["model.embed_tokens.weight"]
         )
-        _write_tensor_fp32(f, lm_src)
+        _write_tensor_fp16(f, lm_src)
 
     print(f"Export complete / 导出完毕: {filepath}")
     print(f"File size: {Path(filepath).stat().st_size / 1024**3:.2f} GiB")

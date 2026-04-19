@@ -59,6 +59,12 @@ public:
     //      verbose=true 打印状态消息（首次调用）；false 静默（预热用）。
     void inject_input(const char* gt_embed_path, bool verbose = true);
 
+    // [EN] Inject a token by ID: look up its row in the embedding table on GPU
+    //      and write the FP16 vector into act.x. Used for autoregressive decode.
+    // [CN] 按 token ID 注入：在 GPU 上查找嵌入表对应行，将 FP16 向量写入 act.x。
+    //      用于自回归解码。
+    void inject_token(int token_id);
+
     // [EN] Run one full forward pass: 28 layers + final_norm + lm_head + argmax.
     //      Writes result to act.d_token_id (device).
     // [CN] 执行一次完整前向传播：28 层 + final_norm + lm_head + argmax。
@@ -85,6 +91,10 @@ public:
 
     EngineProfiler& profiler() { return prof_; }
 
+    // [EN] Access the engine's CUDA stream (needed for graph capture).
+    // [CN] 获取引擎的 CUDA 流（CUDA Graph 捕获需要）。
+    cudaStream_t stream() const { return stream_; }
+
     // Model hyperparameters (set during initialize) / 模型超参数
     int D = 0, FFN = 0, V = 0, NL = 0, GS = 0;
     int NH = 0, NKV = 0, HD = 0;
@@ -109,6 +119,7 @@ private:
     // ── CUDA context / CUDA 上下文 ──────────────────────────────────────
     cudaStream_t   stream_ = nullptr;
     cublasHandle_t cublas_ = nullptr;
+    void*          d_cublas_ws_ = nullptr;  // pre-allocated cuBLAS workspace (graph-capture safe)
     EngineProfiler prof_;
 
     static constexpr size_t SEQ = 1;  // single decode step / 单步解码
