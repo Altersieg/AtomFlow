@@ -1,15 +1,83 @@
-# AtomFlow (AF) Engine
+# AtomFlow
+
+**A Bare-Metal, Zero-Overhead LLM Inference Engine for Consumer GPUs**
 
 **🌐 Language:** **English** | [简体中文](./README.zh-CN.md)
 
 ---
 
-A minimal, from-scratch LLM inference engine for **NVIDIA Ada / Blackwell** GPUs,
-built to expose the physical mechanics of modern inference stacks (FP8 quantisation,
-arena allocation, fused GEMV kernels) in a few thousand lines of readable C++/CUDA.
+## Abstract
 
-**Current status:** End-to-end **Llama 3.2 3B** single-token decode at **~58 tok/s**
-(pure GPU, W8A16 fused GEMV, RTX 5060 Ti 16 GB).
+AtomFlow is a from-scratch CUDA C++ inference engine that achieves **68.7 tok/s** autoregressive decode of **Llama 3.2 3B** on a single **NVIDIA RTX 5060 Ti** (16 GB GDDR7, 448 GB/s, Blackwell).
+
+The engine targets the physical reality of $M=1$ (single-token) decode: at arithmetic intensity < 1, performance is **entirely memory-bandwidth-bound**. Every architectural decision — static arenas, fused W8A16 GEMV, contiguous KV cache — is a direct consequence of this constraint. No dynamic allocation, no indirection, no framework.
+
+| Metric | Value |
+|--------|-------|
+| Model | Llama 3.2 3B · 28L · GQA 24Q/8KV · V=128K |
+| Hardware | RTX 5060 Ti · 16 GB GDDR7 · 448 GB/s |
+| TPOT (CUDA Graph) | 13.3–15.2 ms → **66–75 tok/s** |
+| AR Decode (KV cache) | **65–69 tok/s** |
+| Total VRAM | 5.5 GiB (34% of 16 GB) |
+| W8A16 GEMV Peak BW | 233 GB/s (52% of theoretical) |
+| Runtime cudaMalloc | **0** |
+| Numerical Accuracy | 37/37 layer probes PASS |
+
+---
+
+## Architecture 1: AtomFlow Core — The Extreme Performance Zone
+
+The production single-stream engine. Zero abstraction overhead. Every byte of VRAM accounted for at compile time.
+
+### Key Architectural Decisions
+
+- **Static Arena Allocator**
+  - 4× `cudaMalloc` at init, 0 during inference.
+  - Weight pool (5.17 GiB) + Activation arena (1.5 MiB) + KV Cache pool (224 MiB) + cuBLAS workspace (4 MiB).
+  - All Views are POD descriptors pointing into pre-allocated arenas — no heap, no `new`, no `shared_ptr`.
+
+- **IO-Aware Kernel Fusion**
+  - Fused W8A16 GEMV: FP8-E4M3 dequant + FP16 dot-product in a single kernel pass.
+  - Intermediate dequantized weights exist ONLY in registers — **zero global memory writes**.
+  - Activation arena reduced from 49.5 MiB (with explicit dequant workspace) to **1.5 MiB**.
+
+- **Static KV Cache**
+  - Contiguous `[MAX_SEQ_LEN, KV_DIM]` per layer — pure arithmetic addressing: `cache[t × stride + head × HD + d]`.
+  - No page tables, no indirect loads, no TLB pressure from scattered blocks.
+  - Custom GQA attention kernel: tree-reduction Q·Kᵀ + shared-memory softmax + parallel V accumulation.
+
+- **CUDA Graph Capture**
+  - 280+ kernel launches recorded into a single `cudaGraphExec_t`.
+  - CPU dispatch overhead eliminated entirely — measured 1.04–1.06× speedup over eager.
+
+- **mmap Weight Loading**
+  - Binary model file (`4.87 GiB`) mapped via `mmap` → single bulk `cudaMemcpy` to device pool.
+  - Zero host-side allocation for weights.
+
+---
+
+## Architecture 2: Server Sandbox — The Experimental Zone
+
+An **isolated CMake target** (`atomflow-server-test`) for evaluating server-class scheduling overhead.
+
+**Purpose:**
+
+Provide a headless simulation environment to quantify the physical cost of:
+
+- **Paged KV Cache** — non-contiguous physical blocks + page-table indirection.
+- **Block Managers** — free-list allocation/recycling with copy-on-write reference counting.
+- **Continuous Batching** — dynamic request scheduling with variable sequence lengths.
+
+**Design constraint:**
+
+The sandbox shares ONLY the low-level math kernels (`src/kernel/*`) with the core engine. It does NOT link against `engine.cu` or `main.cu`. No inheritance bridges the two — they are physically separate compilation targets.
+
+```bash
+cmake --build build -j --target atomflow-server-test
+./build/atomflow-server-test
+```
+
+---
 
 ## Build & Run
 
@@ -27,89 +95,106 @@ git clone https://github.com/altersieg/AtomFlow.git
 cd AtomFlow
 cmake -S . -B build
 cmake --build build -j
-./build/atomflow                    # pure benchmark mode (ENABLE_VALIDATOR=0)
+
+./build/atomflow                # benchmark + AR generation
+python tools/decode_tokens.py   # decode token IDs to text
 ```
 
 **Validation mode** (compare every layer against HuggingFace ground truth):
 
 ```bash
-cmake -S . -B build -DCMAKE_CUDA_FLAGS="-DENABLE_VALIDATOR=1 -DENABLE_PROFILER=1"
+cmake -S . -B build -DCMAKE_CUDA_FLAGS="-DENABLE_VALIDATOR=1"
 cmake --build build -j
-./build/atomflow
+./build/atomflow    # Expect: 37/37 PASS, token 791
 ```
 
 **Build modes**
 
-| Mode              | Command                                                          | When to use                          |
-| ----------------- | ---------------------------------------------------------------- | ------------------------------------ |
-| MVP (default)     | `cmake -S . -B build`                                            | Fast iteration, separable compilation |
-| Peak performance  | `cmake -S . -B build -DATOMFLOW_MONOLITHIC_BUILD=ON`             | LTO + aggressive cross-TU inlining    |
+| Mode | Command | Notes |
+|------|---------|-------|
+| MVP (default) | `cmake -S . -B build` | Separable compilation, fast iteration |
+| Peak performance | `cmake -S . -B build -DATOMFLOW_MONOLITHIC_BUILD=ON` | LTO + cross-TU inlining |
+| With profiler | `-DCMAKE_CUDA_FLAGS="-DENABLE_PROFILER=1"` | Per-kernel cudaEvent timing |
+
+---
 
 ## Project Structure
 
 ```
 AtomFlow/
-├── CMakeLists.txt              # CMake: sm_89, MVP / Monolithic build switch
+├── CMakeLists.txt                  # Dual-target build: atomflow + atomflow-server-test
 ├── include/
 │   ├── core/
-│   │   ├── engine.h            # AtomFlowEngine class (init, forward_pass, cleanup)
-│   │   ├── model_state.h       # LayerWeights & ActBuffers POD structs
-│   │   ├── view.h              # POD tensor descriptor (dims, strides, dtype)
-│   │   ├── atom_context.h      # Global runtime context
-│   │   ├── qkvview.h           # Zero-copy QKV slicing
-│   │   └── config.h            # ModelConfig
+│   │   ├── engine.h                # AtomFlowEngine (init, forward_pass, KV cache)
+│   │   ├── model_state.h           # LayerWeights & ActBuffers (POD structs)
+│   │   └── view.h                  # POD tensor descriptor (dims, strides, dtype)
 │   ├── ops/
-│   │   └── kernel.h            # All kernel launcher declarations
+│   │   └── kernel.h                # All kernel launcher declarations
 │   ├── memory/
-│   │   └── weight_loader.h     # mmap-based zero-copy weight loading
+│   │   └── weight_loader.h         # mmap-based weight loading
 │   └── utils/
-│       ├── utils.h             # CUDA_CHECK / CUBLAS_CHECK macros
-│       ├── profiler.h          # EngineProfiler (deferred cudaEvent timing)
-│       └── validator.h         # Ground-truth cosine-similarity validation
+│       ├── utils.h                 # CUDA_CHECK / CUBLAS_CHECK macros
+│       ├── profiler.h              # EngineProfiler (deferred cudaEvent timing)
+│       └── validator.h             # Ground-truth validation (cosine similarity)
 ├── src/
-│   ├── main.cu                 # Lightweight CLI + benchmark harness (~100 lines)
+│   ├── main.cu                     # CLI + benchmark harness + AR loop + token logging
 │   ├── core/
-│   │   └── engine.cu           # AtomFlowEngine implementation
+│   │   └── engine.cu               # AtomFlowEngine full implementation
 │   ├── kernel/
-│   │   ├── helpers.cu          # Embed lookup, FP16↔FP32 cast, RoPE cache, file I/O
-│   │   ├── qkv_gemm.cu         # Fused W8A16 GEMV kernel + cuBLAS GEMM fallback
-│   │   ├── rmsnorm.cu          # FP16 RMSNorm
-│   │   ├── rope.cu             # Rotary Position Embedding (in-place)
-│   │   ├── tiled_attention.cu  # Shared-memory tiled attention
-│   │   ├── residual_add.cu     # Element-wise residual add
-│   │   ├── swiglu.cu           # SwiGLU activation
-│   │   ├── argmax.cu           # Greedy argmax for next-token sampling
-│   │   ├── dequant.cu          # FP8→FP16 dequantisation (legacy, fused path preferred)
-│   │   └── layer.cu            # Layer-level helpers
+│   │   ├── helpers.cu              # Embed lookup, RoPE cache, KV cache writer
+│   │   ├── qkv_gemm.cu            # Fused W8A16 GEMV + cuBLAS lm_head GEMM
+│   │   ├── tiled_attention.cu     # GQA cached attention (M=1 optimised)
+│   │   ├── rmsnorm.cu             # FP16 RMSNorm
+│   │   ├── rope.cu                # Rotary Position Embedding (in-place)
+│   │   ├── residual_add.cu        # Element-wise residual add
+│   │   ├── swiglu.cu              # SwiGLU activation
+│   │   └── argmax.cu              # Greedy argmax sampling
+│   ├── experimental/
+│   │   └── server_arch/
+│   │       ├── server_engine.h     # ServerEngine class (sandbox)
+│   │       ├── server_engine.cu    # Entry point for atomflow-server-test
+│   │       └── paged_kv_manager.h  # KVBlock, PageTable, BlockManager stubs
 │   └── utils/
-│       ├── profiler.cpp        # EngineProfiler implementation
-│       └── validator.cpp       # Ground-truth comparison utilities
+│       ├── profiler.cpp            # EngineProfiler implementation
+│       └── validator.cpp           # Ground-truth comparison
 └── tools/
-    ├── export_atomflow.py      # Export HF Llama 3.2 → AtomFlow .bin (AWQ + FP8)
-    └── dump_ground_truth.py    # Dump per-layer activations for validation
+    ├── export_atomflow.py          # HF Llama 3.2 → AtomFlow .bin (AWQ + FP8 GS=128)
+    ├── dump_ground_truth.py        # Per-layer activation dump for validator
+    └── decode_tokens.py            # Offline token → text decoder (local tokenizer)
 ```
+
+---
 
 ## Roadmap
 
-- [x] `View` + zero-copy QKV slicing
-- [x] RMSNorm, RoPE, SwiGLU, residual_add kernels
-- [x] Tiled attention kernel (shared-memory)
-- [x] FP8 weight export with AWQ smoothing (`export_atomflow.py`)
-- [x] End-to-end Llama 3.2 3B single-token decode (28 layers + lm_head)
-- [x] **Fused W8A16 GEMV kernel** (FP8 dequant + dot-product in one pass, zero intermediate writes)
-- [x] Modular `AtomFlowEngine` class (init / forward / cleanup)
-- [x] Pure GPU benchmark mode (`ENABLE_VALIDATOR=0`, `ENABLE_PROFILER=0`)
-- [x] Per-layer ground-truth validation (37/37 PASS)
-- [ ] KV cache for multi-token generation
-- [ ] CUDA Graphs for decode loop
-- [ ] RadixAttention KV-cache sharing
-- [ ] Tensor Core `mma` attention path
+### Core Engine
+
+- [x] Static arena allocator (weight + activation + KV cache pools)
+- [x] Fused W8A16 GEMV (zero intermediate DRAM writes, 233 GB/s peak)
+- [x] Static KV Cache + GQA cached attention (autoregressive decode)
+- [x] CUDA Graph capture (280+ kernels → single graph dispatch)
+- [x] Per-layer numerical validation (37/37 PASS)
+- [x] Token logging + offline Python decoder
+- [ ] **Prefill phase optimisation** — GEMM-based batched token processing for TTFT reduction
+- [ ] Tensor Core `mma.sync` attention path for long-context decode
+- [ ] Top-K / Top-P sampling with temperature scaling
 - [ ] Python bindings (PyBind11)
 - [ ] Multi-GPU via NCCL
 
+### Server Sandbox
+
+- [x] Isolated CMake target with shared kernel math
+- [x] ServerEngine scaffolding + BlockManager/PageTable stubs
+- [ ] **PagedAttention kernel** — benchmark exact latency delta vs. static contiguous KV
+- [ ] Continuous batching scheduler with multi-request queue
+- [ ] Quantitative comparison: page-table lookup overhead (ns) vs. linear indexing
+
+---
+
 ## Design Philosophy
 
-- **Simple Infrastructure** — POD-based `View` system for zero-overhead tensor management.
-- **Cool Kernels** — fused W8A16 GEMV with vectorised FP8 loads, warp-shuffle reduction, zero intermediate global writes.
-- **Minimalist Dispatch** — direct mapping from logical views to hardware grids, no framework overhead.
-- **Industrial Modularity** — `AtomFlowEngine` encapsulates all GPU state; `main.cu` is a thin ~100-line harness.
+- **Physics First** — Every decision derived from hardware constraints (448 GB/s BW, 16 GB VRAM, $M=1$ arithmetic intensity < 1).
+- **Zero Runtime Allocation** — All memory statically partitioned at init; inference is pure kernel dispatch.
+- **Fuse Everything** — If two kernels share data, they must become one kernel. No intermediate DRAM round-trips.
+- **Measure, Don't Assume** — Built-in profiler (`ENABLE_PROFILER=1`) and validator (`ENABLE_VALIDATOR=1`) for every claim.
+- **Dual Architecture** — Production engine optimises for what IS fast (static, contiguous, single-stream). Sandbox explores what COULD be needed (paging, batching, scheduling).
