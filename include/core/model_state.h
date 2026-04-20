@@ -51,6 +51,15 @@ struct ActBuffers {
     View up_out;        // FP16 [1, FFN]      up_proj
     View ffn_out;       // FP16 [1, D]        o_proj output; reused for down_proj output
     View logits;        // FP32 [1, V]
-    View dequant_ws;    // FP16 [FFN, D]      workspace for FP8→FP16 dequantized weights
     int*   d_token_id;  // INT32 [1]
+
+    // ── Static KV Cache views (one per layer, allocated from d_kv_pool_)
+    // 静态 KV 缓存 View（每层一个，从 d_kv_pool_ 分配）
+    // Shape per view: [MAX_SEQ_LEN, KV_DIM], dtype FP16.
+    // Written to during forward_pass (future), read by tiled_attention.
+    // 每个 View 形状：[MAX_SEQ_LEN, KV_DIM]，FP16。
+    // 前向传播时写入（尚未实现），注意力层读取。
+    static constexpr int MAX_LAYERS = 64;
+    View k_cache[MAX_LAYERS];  // FP16 [MAX_SEQ_LEN, KV_DIM] per layer
+    View v_cache[MAX_LAYERS];  // FP16 [MAX_SEQ_LEN, KV_DIM] per layer
 };

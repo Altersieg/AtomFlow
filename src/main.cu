@@ -187,31 +187,60 @@ int main(int argc, char* argv[]) {
 #endif
 
 #if !ENABLE_VALIDATOR
-    // ── 6. Autoregressive generation loop / 自回归生成循环 ─────────────
-    //    Feed the predicted token_id back as input embedding and repeat.
-    //    Without KV cache, each step sees only seq_len=1 (no history),
-    //    so the generated text will be incoherent — but this validates
-    //    the full decode loop plumbing before we implement KV cache.
+    // ── 6. Autoregressive generation loop (with KV cache) / 自回归生成循环（带 KV 缓存）
+    //    Reset the KV cache, then iterate: inject token → set position → forward.
+    //    The engine writes K,V into the cache at current_pos_ and attends over
+    //    all cached history [0, current_pos_].
     //    Skipped in validator mode: AR changes the input, making GT probes
     //    fire spurious FATALs.
     //
-    //    将预测的 token_id 的嵌入重新喂给引擎并重复。
-    //    无 KV 缓存时，每步仅看到 seq_len=1（无历史），
-    //    因此生成文本将不连贯 — 但这可在实现 KV 缓存前
-    //    验证完整的解码循环管线。
+    //    重置 KV 缓存，然后循环：注入 token → 设置位置 → 前向传播。
+    //    引擎将 K,V 写入缓存的 current_pos_ 行，并对
+    //    所有已缓存历史 [0, current_pos_] 进行注意力。
     //    在验证器模式下跳过：AR 改变输入，会使 GT 探针产生虚假 FATAL。
     constexpr int AR_STEPS = 20;
-    std::printf("\n[AR]  Autoregressive generation: %d steps (no KV cache)\n", AR_STEPS);
+    std::printf("\n[AR]  Autoregressive generation: %d steps (KV cache)\n", AR_STEPS);
+
+    // [EN] Open token log file for the Python decoder to consume.
+    //      Each line contains one integer token ID.
+    // [CN] 打开 token 日志文件供 Python 解码器消费。
+    //      每行包含一个整数 token ID。
+    static constexpr const char* TOKEN_LOG_PATH = "output_tokens.txt";
+    FILE* f_out = std::fopen(TOKEN_LOG_PATH, "w");
+    if (!f_out) {
+        std::fprintf(stderr, "[AR]  ERROR: cannot open %s for writing\n", TOKEN_LOG_PATH);
+        return EXIT_FAILURE;
+    }
+
+    engine.reset_kv_cache();
+
+    // Step 0: re-inject GT embeddings at position 0.
+    // 步骤 0：在位置 0 重新注入 GT 嵌入。
+    engine.current_pos_ = 0;
+    engine.inject_input(GT_EMBED_PATH, /*verbose=*/false);
+    engine.forward_pass();
+    token_id = engine.get_output_token();
     std::printf("[AR]  step  0 → token %d\n", token_id);
+    // [EN] Log token to disk with immediate flush for real-time availability.
+    // [CN] 将 token 写入磁盘并立即刷新，确保实时可用。
+    std::fprintf(f_out, "%d\n", token_id);
+    std::fflush(f_out);
 
     auto ar_start = std::chrono::steady_clock::now();
     for (int step = 1; step <= AR_STEPS; ++step) {
+        engine.current_pos_ = step;
         engine.inject_token(token_id);
         engine.forward_pass();
         token_id = engine.get_output_token();
         std::printf("[AR]  step %2d → token %d\n", step, token_id);
+        std::fprintf(f_out, "%d\n", token_id);
+        std::fflush(f_out);
     }
     auto ar_end = std::chrono::steady_clock::now();
+
+    // [EN] Close token log file. / [CN] 关闭 token 日志文件。
+    std::fclose(f_out);
+    std::printf("[AR]  Token IDs written to %s\n", TOKEN_LOG_PATH);
 
     double ar_total_ms = std::chrono::duration<double, std::milli>(ar_end - ar_start).count();
     double ar_tps      = AR_STEPS * 1000.0 / ar_total_ms;

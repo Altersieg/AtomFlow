@@ -73,6 +73,9 @@ file(GLOB_RECURSE ATOMFLOW_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"  # includes profiler.cpp
 )
+# [EN] Exclude experimental sandbox sources — they belong to a separate target.
+# [CN] 排除实验性沙箱源文件 — 它们属于单独的构建目标。
+list(FILTER ATOMFLOW_SOURCES EXCLUDE REGEX "src/experimental/")
 
 add_executable(atomflow ${ATOMFLOW_SOURCES})
 
@@ -128,7 +131,74 @@ target_compile_options(atomflow PRIVATE
 )
 
 # ============================================================================
-# 6. Reserved subdirectories: Python bindings / Tests
+# 6. Experimental: atomflow-server-test executable
+# ----------------------------------------------------------------------------
+# [EN] A physically separate target that shares ONLY the low-level math
+#      kernels (src/kernel/*) with the production engine. It has its own
+#      main() in server_engine.cu. Nothing in src/core/ or src/main.cu is
+#      compiled into this target.
+# [CN] 一个物理上独立的构建目标，仅与生产引擎共享底层数学 kernel
+#      （src/kernel/*）。它在 server_engine.cu 中有自己的 main()。
+#      src/core/ 和 src/main.cu 中的任何内容都不会编译进此目标。
+# ============================================================================
+file(GLOB_RECURSE SERVER_KERNEL_SOURCES
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/*.cu"
+)
+file(GLOB_RECURSE SERVER_ARCH_SOURCES
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/experimental/server_arch/*.cu"
+)
+
+add_executable(atomflow-server-test
+    ${SERVER_KERNEL_SOURCES}
+    ${SERVER_ARCH_SOURCES}
+)
+
+target_include_directories(atomflow-server-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/experimental/server_arch"  # local headers
+)
+
+target_link_libraries(atomflow-server-test PRIVATE
+    CUDA::cudart
+    CUDA::cublas
+)
+
+# Apply the same build-mode and compile-options as the main target.
+if(ATOMFLOW_MONOLITHIC_BUILD)
+    set_target_properties(atomflow-server-test PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        INTERPROCEDURAL_OPTIMIZATION ON
+    )
+    target_compile_options(atomflow-server-test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-dlto>
+    )
+    target_link_options(atomflow-server-test PRIVATE
+        $<$<LINK_LANGUAGE:CUDA>:-dlto>
+    )
+else()
+    set_target_properties(atomflow-server-test PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+endif()
+
+target_compile_options(atomflow-server-test PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr
+        --use_fast_math
+        -Xcompiler=-Wall
+        -lineinfo
+    >
+)
+target_compile_options(atomflow-server-test PRIVATE
+    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-O3>
+    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
+)
+
+# ============================================================================
+# 7. Reserved subdirectories: Python bindings / Tests
 # ============================================================================
 if(ATOMFLOW_BUILD_TESTS)
     enable_testing()
@@ -140,7 +210,7 @@ if(ATOMFLOW_BUILD_PYTHON)
 endif()
 
 # ============================================================================
-# 7. Configuration summary
+# 8. Configuration summary
 # ============================================================================
 message(STATUS "==========================================================")
 message(STATUS "  AtomFlow build configuration")

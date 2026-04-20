@@ -159,3 +159,138 @@ void launch_tiled_attention_kernel(
 template void launch_tiled_attention_kernel<half>(
     const half*, const half*, const half*, half*,
     int, int, int, int, int, cudaStream_t);
+
+// ============================================================================
+// gqa_cached_attention_kernel — Autoregressive M=1 decode with KV cache
+// gqa_cached_attention_kernel — 带 KV 缓存的自回归 M=1 解码
+//
+// [EN] Design for single-token decode (M=1):
+//   Grid : n_q_heads blocks      (24 for Llama 3.2 3B)
+//   Block: head_dim threads       (128)
+//   Each block handles one query head’s full attention computation.
+//
+//   Phase 1 — Score computation:
+//     For each history position t in [0, seq_len):
+//       All HD threads compute Q[h,d]*K[t,kv_h,d] in parallel,
+//       then tree-reduce to a single dot product. Thread 0 stores
+//       score[t] = dot / sqrt(HD) into shared memory.
+//
+//   Phase 2 — Softmax (thread 0):
+//     Online max + exp + normalize over seq_len scores.
+//
+//   Phase 3 — Weighted V accumulation:
+//     Each thread d accumulates sum_t(score[t] * V[t,kv_h,d]).
+//
+// [CN] 单 token 解码 (M=1) 设计：
+//   Grid : n_q_heads 个 block
+//   Block: head_dim 个线程
+//   每个 block 处理一个 query head 的完整注意力计算。
+//
+//   第1阶段 — Score 计算：树形规约得到 Q·K^T / sqrt(HD)。
+//   第2阶段 — Softmax：线程 0 计算在线 max + exp + 归一化。
+//   第3阶段 — 加权 V 累加：每个线程 d 累加 score[t] * V[t,kv_h,d]。
+//
+// Shared memory: (head_dim + seq_len) * sizeof(float).
+// For MAX_SEQ_LEN=2048, HD=128: (128+2048)*4 = 8.5 KB per block. Fine.
+// ============================================================================
+__global__ void gqa_cached_attention_kernel(
+    const half* __restrict__ q,        // [1, n_q_heads * head_dim]
+    const half* __restrict__ k_cache,  // [MAX_SEQ_LEN, n_kv_heads * head_dim]
+    const half* __restrict__ v_cache,  // [MAX_SEQ_LEN, n_kv_heads * head_dim]
+    half* __restrict__ out,            // [1, n_q_heads * head_dim]
+    int seq_len,      // current_pos + 1
+    int head_dim,     // 128
+    int n_q_heads,    // 24
+    int n_kv_heads)   // 8
+{
+    const int h    = blockIdx.x;    // query head index [0, NH)
+    const int d    = threadIdx.x;   // head dim index   [0, HD)
+    const int kv_h = h * n_kv_heads / n_q_heads;  // GQA mapping / GQA 映射
+    const int KV_stride = n_kv_heads * head_dim;   // row stride in KV cache
+
+    const float inv_sqrt_hd = rsqrtf(static_cast<float>(head_dim));
+
+    // [EN] Load Q[h, d] into register once (reused for every key position).
+    // [CN] 将 Q[h, d] 加载到寄存器（每个 key 位置复用）。
+    const float q_val = __half2float(q[h * head_dim + d]);
+
+    // Shared memory layout: [head_dim] reduction buffer + [seq_len] scores
+    // 共享内存布局：[head_dim] 规约缓冲 + [seq_len] 分数
+    extern __shared__ float smem[];
+    float* s_reduce = smem;                // [head_dim]
+    float* s_scores = smem + head_dim;     // [seq_len]
+
+    // ── Phase 1: Compute attention scores / 计算注意力分数 ─────────────
+    for (int t = 0; t < seq_len; ++t) {
+        // [EN] Each thread contributes Q[d]*K[t,kv_h,d] to the dot product.
+        // [CN] 每个线程贡献点积的 Q[d]*K[t,kv_h,d] 项。
+        float k_val = __half2float(k_cache[t * KV_stride + kv_h * head_dim + d]);
+        s_reduce[d] = q_val * k_val;
+        __syncthreads();
+
+        // [EN] Tree reduction across head_dim threads.
+        // [CN] head_dim 个线程的树形规约。
+        for (int stride = head_dim >> 1; stride > 0; stride >>= 1) {
+            if (d < stride) s_reduce[d] += s_reduce[d + stride];
+            __syncthreads();
+        }
+
+        // Thread 0 stores the scaled score / 线程 0 存储缩放后的分数
+        if (d == 0) s_scores[t] = s_reduce[0] * inv_sqrt_hd;
+        __syncthreads();
+    }
+
+    // ── Phase 2: Softmax (thread 0 only) / Softmax（仅线程 0） ──────────
+    if (d == 0) {
+        float max_s = -1e38f;
+        for (int t = 0; t < seq_len; ++t)
+            max_s = fmaxf(max_s, s_scores[t]);
+
+        float sum_exp = 0.0f;
+        for (int t = 0; t < seq_len; ++t) {
+            s_scores[t] = expf(s_scores[t] - max_s);
+            sum_exp += s_scores[t];
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        for (int t = 0; t < seq_len; ++t)
+            s_scores[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    // ── Phase 3: Weighted V accumulation / 加权 V 累加 ────────────────
+    float acc = 0.0f;
+    for (int t = 0; t < seq_len; ++t) {
+        float v_val = __half2float(v_cache[t * KV_stride + kv_h * head_dim + d]);
+        acc += s_scores[t] * v_val;
+    }
+
+    out[h * head_dim + d] = __float2half(acc);
+}
+
+// ============================================================================
+// launch_cached_attention — Launcher for autoregressive GQA with KV cache
+// launch_cached_attention — 带 KV 缓存的自回归 GQA 启动器
+// ============================================================================
+void launch_cached_attention(
+    const half* q,          // [1, n_q_heads * head_dim]
+    const half* k_cache,    // [MAX_SEQ_LEN, n_kv_heads * head_dim]
+    const half* v_cache,    // [MAX_SEQ_LEN, n_kv_heads * head_dim]
+    half* out,              // [1, n_q_heads * head_dim]
+    int seq_len,            // current_pos + 1
+    int head_dim,           // 128
+    int n_q_heads,          // 24
+    int n_kv_heads,         // 8
+    cudaStream_t stream)
+{
+    // [EN] One block per query head, head_dim threads per block.
+    // [CN] 每个 query head 一个 block，每个 block head_dim 个线程。
+    int blocks = n_q_heads;
+    int threads = head_dim;
+    size_t smem_bytes = static_cast<size_t>(head_dim + seq_len) * sizeof(float);
+
+    gqa_cached_attention_kernel<<<blocks, threads, smem_bytes, stream>>>(
+        q, k_cache, v_cache, out,
+        seq_len, head_dim, n_q_heads, n_kv_heads);
+    CUDA_CHECK_LAST();
+}

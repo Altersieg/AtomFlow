@@ -149,43 +149,6 @@ void launch_w8a16_gemv(
     CUDA_CHECK_LAST();
 }
 
-// [EN] FP16 × FP16 → FP16 GEMM with FP32 accumulation.
-//      Used after dequantizing FP8 weights to FP16 via launch_dequantize_fp8_to_fp16.
-//      Same column-major tricks as launch_linear_gemm.
-// [CN] FP16×FP16→FP16 GEMM（FP32 累加）。
-//      在通过 launch_dequantize_fp8_to_fp16 将 FP8 权重反量化为 FP16 后使用。
-//      列主序技巧与 launch_linear_gemm 相同。
-void launch_fp16x16_gemm(
-    const View& input,
-    const View& weight,
-    View& output,
-    cublasHandle_t handle,
-    cudaStream_t /*stream*/)
-{
-    int m = calculate_rows(input);
-    int k = input.dims[input.num_dims - 1];
-    int n = weight.dims[0];
-
-    const float alpha = 1.0f;
-    const float beta  = 0.0f;
-
-    // Row-major GEMM: Y[m,n] = X[m,k] × W[n,k]ᵀ
-    // cuBLAS is column-major.  Trick: treat row-major A[r,c] as col-major A^T[c,r].
-    //   W_rm[n,k]  col-major view → W^T[k,n].  Apply OP_T → W[n,k] = correct weight.  lda = k.
-    //   X_rm[m,k]  col-major view → X^T[k,m].  Apply OP_N → X^T[k,m].  ldb = k.
-    // C_cm[n,m] = W[n,k] × X^T[k,m] = (X × W^T)^T = Y^T → viewed as row-major gives Y[m,n]. ✓
-    CUBLAS_CHECK(cublasGemmEx(handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        n, m, k,
-        &alpha,
-        weight.data_ptr, CUDA_R_16F, k,  // W[n,k] row-major, read as col-major [k,n] → W^T
-        input.data_ptr,  CUDA_R_16F, k,  // X[m,k] row-major, read as col-major [k,m] → X^T
-        &beta,
-        output.data_ptr, CUDA_R_16F, n,  // Y[m,n] row-major (written as Y^T col-major [n,m])
-        CUBLAS_COMPUTE_32F,               // FP32 accumulation for accuracy
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-}
-
 // [EN] Universal Linear GEMM launcher (also used for QKV fused projection).
 // [CN] 通用 Linear/GEMM 启动器 (同时用于融合 QKV 投影)。
 // [Bug/Imperfection: Hardcodes FP8 weight + FP16 activation path; does not yet dispatch on View::dtype.

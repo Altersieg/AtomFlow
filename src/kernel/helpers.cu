@@ -85,25 +85,72 @@ size_t load_fp32_bin_to_fp16_device(const char* path,
 // ============================================================================
 // RoPE precomputation (CPU → GPU)
 // RoPE 预计算（CPU → GPU）
+//
+// [EN] Cache layout: [max_seq, head_dim/2] — one float per unique frequency
+//      pair, matching rope_kernel’s indexing: cache_id = pos * (head_dim/2) + d.
+// [CN] 缓存布局：[max_seq, head_dim/2] — 每个独立频率对一个 float，
+//      与 rope_kernel 的索引 cache_id = pos * (head_dim/2) + d 一致。
 // ============================================================================
 void build_rope_cache(float* d_cos, float* d_sin,
                       int max_seq, int head_dim, float base,
                       cudaStream_t stream) {
-    std::vector<float> h_cos(max_seq * head_dim);
-    std::vector<float> h_sin(max_seq * head_dim);
+    const int half_dim = head_dim / 2;
+    std::vector<float> h_cos(max_seq * half_dim);
+    std::vector<float> h_sin(max_seq * half_dim);
     for (int s = 0; s < max_seq; ++s) {
-        for (int i = 0; i < head_dim / 2; ++i) {
+        for (int i = 0; i < half_dim; ++i) {
             float theta = s / std::pow(base, 2.0f * i / head_dim);
-            h_cos[s * head_dim + 2 * i]     = std::cos(theta);
-            h_cos[s * head_dim + 2 * i + 1] = std::cos(theta);
-            h_sin[s * head_dim + 2 * i]     = std::sin(theta);
-            h_sin[s * head_dim + 2 * i + 1] = std::sin(theta);
+            h_cos[s * half_dim + i] = std::cos(theta);
+            h_sin[s * half_dim + i] = std::sin(theta);
         }
     }
     CUDA_CHECK(cudaMemcpyAsync(d_cos, h_cos.data(),
-                               max_seq * head_dim * sizeof(float),
+                               max_seq * half_dim * sizeof(float),
                                cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_sin, h_sin.data(),
-                               max_seq * head_dim * sizeof(float),
+                               max_seq * half_dim * sizeof(float),
                                cudaMemcpyHostToDevice, stream));
+}
+
+// ============================================================================
+// KV Cache Writer
+// KV 缓存写入器
+//
+// [EN] Copy post-RoPE K and V vectors from the current token’s qkv_out
+//      into the static KV cache at row `current_pos`.
+//      qkv_out layout: [Q_DIM | KV_DIM | KV_DIM].
+// [CN] 将当前 token 的 RoPE 后 K、V 向量从 qkv_out 复制到
+//      静态 KV 缓存的第 current_pos 行。
+//      qkv_out 布局：[Q_DIM | KV_DIM | KV_DIM]。
+// ============================================================================
+__global__ void k_write_kv_cache(
+    const half* __restrict__ qkv_out,  // [1, Q_DIM + KV_DIM + KV_DIM]
+    half* __restrict__ k_dst,          // [MAX_SEQ_LEN, KV_DIM]
+    half* __restrict__ v_dst,          // [MAX_SEQ_LEN, KV_DIM]
+    int current_pos,
+    int q_dim,
+    int kv_dim)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d < kv_dim) {
+        k_dst[current_pos * kv_dim + d] = qkv_out[q_dim + d];
+        v_dst[current_pos * kv_dim + d] = qkv_out[q_dim + kv_dim + d];
+    }
+}
+
+void launch_write_kv_cache(
+    const View& qkv_out,   // FP16 [1, QKV_OUT]
+    View& k_cache,         // FP16 [MAX_SEQ_LEN, KV_DIM]
+    View& v_cache,         // FP16 [MAX_SEQ_LEN, KV_DIM]
+    int current_pos,
+    int q_dim,
+    int kv_dim,
+    cudaStream_t stream)
+{
+    k_write_kv_cache<<<(kv_dim + 255) / 256, 256, 0, stream>>>(
+        static_cast<const half*>(qkv_out.data_ptr),
+        static_cast<half*>(k_cache.data_ptr),
+        static_cast<half*>(v_cache.data_ptr),
+        current_pos, q_dim, kv_dim);
+    CUDA_CHECK_LAST();
 }

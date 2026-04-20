@@ -16,6 +16,7 @@
 AtomFlowEngine::~AtomFlowEngine() {
     if (d_weight_pool_) cudaFree(d_weight_pool_);
     if (d_act_pool_)    cudaFree(d_act_pool_);
+    if (d_kv_pool_)     cudaFree(d_kv_pool_);
     if (d_cublas_ws_)   cudaFree(d_cublas_ws_);
     if (stream_)        cudaStreamDestroy(stream_);
     if (cublas_)        cublasDestroy(cublas_);
@@ -154,10 +155,11 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
     act_sz += SEQ * QKV_OUT      * sizeof(half);        // qkv_out
     act_sz += SEQ * FFN          * sizeof(half)  * 2;  // gate_out, up_out
     act_sz += SEQ * D            * sizeof(half);        // ffn_out
-    act_sz += (size_t)FFN * D   * sizeof(half);        // dequant_ws
     act_sz += SEQ * V            * sizeof(float);       // logits FP32
     act_sz += sizeof(int);                              // token_id
-    act_sz += 2 * HD             * sizeof(float);       // rope cos/sin
+    // [EN] RoPE cache: [MAX_SEQ_LEN, HD/2] per cos and sin.
+    // [CN] RoPE 缓存：cos 和 sin 各 [MAX_SEQ_LEN, HD/2]。
+    act_sz += 2 * (size_t)MAX_SEQ_LEN * (HD / 2) * sizeof(float);
 
     CUDA_CHECK(cudaMalloc(&d_act_pool_, act_sz));
     CUDA_CHECK(cudaMemset(d_act_pool_, 0, act_sz));
@@ -177,13 +179,42 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
     act_.gate_out   = mk(SEQ*FFN    *sizeof(half),  DataType::FP16, {(int)SEQ, FFN});
     act_.up_out     = mk(SEQ*FFN    *sizeof(half),  DataType::FP16, {(int)SEQ, FFN});
     act_.ffn_out    = mk(SEQ*D          *sizeof(half),  DataType::FP16, {(int)SEQ, D});
-    act_.dequant_ws = mk((size_t)FFN*D  *sizeof(half),  DataType::FP16, {FFN, D});
     act_.logits     = mk(SEQ*V      *sizeof(float), DataType::FP32, {(int)SEQ, V});
     act_.d_token_id = reinterpret_cast<int*>(a);   a += sizeof(int);
-    d_cos_          = reinterpret_cast<float*>(a); a += HD * sizeof(float);
-    d_sin_          = reinterpret_cast<float*>(a); a += HD * sizeof(float);
+    d_cos_          = reinterpret_cast<float*>(a); a += (size_t)MAX_SEQ_LEN * (HD / 2) * sizeof(float);
+    d_sin_          = reinterpret_cast<float*>(a); a += (size_t)MAX_SEQ_LEN * (HD / 2) * sizeof(float);
 
-    // ── 5. CUDA context, RoPE cache / CUDA 上下文、RoPE 缓存 ───────────
+    // ── 5. Allocate KV cache pool / 分配 KV 缓存池 ─────────────────
+    // [EN] One contiguous allocation for all layers' K and V caches.
+    //      Layout: [L0_K | L0_V | L1_K | L1_V | ... | L(NL-1)_K | L(NL-1)_V]
+    //      Each slab: MAX_SEQ_LEN * KV_DIM * sizeof(half) bytes.
+    // [CN] 一次性连续分配所有层的 K 和 V 缓存。
+    //      布局：[L0_K | L0_V | L1_K | L1_V | ... | L(NL-1)_K | L(NL-1)_V]
+    //      每块：MAX_SEQ_LEN * KV_DIM * sizeof(half) 字节。
+    {
+        const size_t slab_bytes = (size_t)MAX_SEQ_LEN * KV_DIM * sizeof(half);
+        const size_t kv_pool_sz = (size_t)NL * 2 * slab_bytes;
+
+        CUDA_CHECK(cudaMalloc(&d_kv_pool_, kv_pool_sz));
+        CUDA_CHECK(cudaMemset(d_kv_pool_, 0, kv_pool_sz));
+
+        uint8_t* kv_cur = static_cast<uint8_t*>(d_kv_pool_);
+        for (int i = 0; i < NL; ++i) {
+            act_.k_cache[i] = create_contiguous_view(
+                kv_cur, DataType::FP16, {MAX_SEQ_LEN, KV_DIM});
+            kv_cur += slab_bytes;
+
+            act_.v_cache[i] = create_contiguous_view(
+                kv_cur, DataType::FP16, {MAX_SEQ_LEN, KV_DIM});
+            kv_cur += slab_bytes;
+        }
+        current_pos_ = 0;
+
+        std::printf("[KV cache]  GPU alloc %.2f MiB  (%d layers \u00d7 2 \u00d7 %d \u00d7 %d \u00d7 FP16)\n",
+                    (double)kv_pool_sz / (1 << 20), NL, MAX_SEQ_LEN, KV_DIM);
+    }
+
+    // ── 6. CUDA context, RoPE cache / CUDA 上下文、RoPE 缓存 ───────────
     CUBLAS_CHECK(cublasCreate(&cublas_));
     CUDA_CHECK(cudaStreamCreate(&stream_));
     CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
@@ -197,7 +228,9 @@ void AtomFlowEngine::initialize(const std::string& weights_path) {
     CUDA_CHECK(cudaMalloc(&d_cublas_ws_, CUBLAS_WS_SIZE));
     CUBLAS_CHECK(cublasSetWorkspace(cublas_, d_cublas_ws_, CUBLAS_WS_SIZE));
 
-    build_rope_cache(d_cos_, d_sin_, /*max_seq=*/1, HD, /*base=*/500000.0f, stream_);
+    // [EN] Build RoPE cache for all positions up to MAX_SEQ_LEN.
+    // [CN] 为所有位置（至 MAX_SEQ_LEN）构建 RoPE 缓存。
+    build_rope_cache(d_cos_, d_sin_, MAX_SEQ_LEN, HD, /*base=*/500000.0f, stream_);
 }
 
 // ============================================================================
@@ -290,29 +323,50 @@ void AtomFlowEngine::forward_pass() {
             + SEQ * QKV_OUT * sizeof(half));
 #endif
 
-        // ── Step 3: QKV split + RoPE / QKV 拆分 + RoPE ─────────────────
+        // ── Step 3: QKV split + RoPE / QKV 拆分 + RoPE ───────────────
         half* const qkv_base = static_cast<half*>(act_.qkv_out.data_ptr);
         half* const q_ptr    = qkv_base;
         half* const k_ptr    = qkv_base + Q_DIM;
-        half* const v_ptr    = qkv_base + Q_DIM + KV_DIM;
         View q_view = create_contiguous_view(q_ptr, DataType::FP16, {(int)SEQ, Q_DIM});
         View k_view = create_contiguous_view(k_ptr, DataType::FP16, {(int)SEQ, KV_DIM});
         {
 #if ENABLE_PROFILER
             auto _t = prof_.scoped_device("rope", stream_);
 #endif
-            launch_rope(q_view, k_view, d_cos_, d_sin_, (int)SEQ, NKV, NH, HD, stream_);
+            // [EN] Pass position-offset cos/sin pointers so that
+            //      rope_kernel (pos=0, seq=1) reads from current_pos_.
+            // [CN] 传入位置偏移后的 cos/sin 指针，使
+            //      rope_kernel (pos=0, seq=1) 读取 current_pos_ 的值。
+            const int half_hd = HD / 2;
+            launch_rope(q_view, k_view,
+                        d_cos_ + current_pos_ * half_hd,
+                        d_sin_ + current_pos_ * half_hd,
+                        (int)SEQ, NKV, NH, HD, stream_);
         }
 
-        // ── Step 4: Tiled Attention / Tiled 注意力 ──────────────────────
+        // ── Step 3b: Write K,V into KV cache / 将 K,V 写入 KV 缓存 ─────
         {
 #if ENABLE_PROFILER
-            auto _t = prof_.scoped_device("tiled_attn", stream_);
+            auto _t = prof_.scoped_device("kv_cache_write", stream_);
 #endif
-            launch_tiled_attention_kernel<half>(
-                q_ptr, k_ptr, v_ptr,
+            launch_write_kv_cache(act_.qkv_out,
+                                  act_.k_cache[layer], act_.v_cache[layer],
+                                  current_pos_, Q_DIM, KV_DIM, stream_);
+        }
+
+        // ── Step 4: Cached GQA Attention / 带缓存的 GQA 注意力 ─────────
+        {
+#if ENABLE_PROFILER
+            auto _t = prof_.scoped_device("cached_attn", stream_);
+#endif
+            // [EN] seq_len = current_pos + 1  (attend over all cached history).
+            // [CN] seq_len = current_pos + 1（对所有已缓存历史进行注意力）。
+            launch_cached_attention(
+                q_ptr,
+                static_cast<const half*>(act_.k_cache[layer].data_ptr),
+                static_cast<const half*>(act_.v_cache[layer].data_ptr),
                 static_cast<half*>(act_.attn_out.data_ptr),
-                (int)SEQ, (int)SEQ, HD, NH, NKV, stream_);
+                current_pos_ + 1, HD, NH, NKV, stream_);
         }
 
         // ── Step 5: Fused W8A16 O_proj / 融合 W8A16 O 投影 ─────────────

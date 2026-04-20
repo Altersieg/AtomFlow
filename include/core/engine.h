@@ -36,6 +36,10 @@
 #define ENABLE_PROFILER  0
 #endif
 
+// [EN] Maximum sequence length for the static KV cache.
+// [CN] 静态 KV 缓存的最大序列长度。
+static constexpr int MAX_SEQ_LEN = 2048;
+
 class AtomFlowEngine {
 public:
     AtomFlowEngine()  = default;
@@ -75,6 +79,16 @@ public:
     // [CN] 将输出 token_id 从设备拷贝到主机并返回。
     int  get_output_token();
 
+    // [EN] Reset the KV cache position counter (call before a new generation).
+    // [CN] 重置 KV 缓存位置计数器（在新一轮生成前调用）。
+    void reset_kv_cache() { current_pos_ = 0; }
+
+    // [EN] Current write position in the KV cache (0 = empty, MAX_SEQ_LEN = full).
+    //      Set by caller before each forward_pass() in the AR loop.
+    // [CN] KV 缓存当前写入位置（0 = 空，MAX_SEQ_LEN = 已满）。
+    //      在 AR 循环中每次 forward_pass() 前由调用方设置。
+    int current_pos_ = 0;
+
     // ── Validation (only active when ENABLE_VALIDATOR=1) / 验证 ─────────
 
 #if ENABLE_VALIDATOR
@@ -101,9 +115,10 @@ public:
     int Q_DIM = 0, KV_DIM = 0, QKV_OUT = 0;
 
 private:
-    // ── GPU memory pools / GPU 内存池 ────────────────────────────────────
+    // ── GPU memory pools / GPU 内存池 ────────────────────────────────
     void* d_weight_pool_ = nullptr;
     void* d_act_pool_    = nullptr;
+    void* d_kv_pool_     = nullptr;  // [EN] Static KV cache pool / [CN] 静态 KV 缓存池
 
     // ── Model state / 模型状态 ──────────────────────────────────────────
     std::vector<LayerWeights> lw_;
