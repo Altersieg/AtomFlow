@@ -1,0 +1,4 @@
+[console_scripts]
+atomflow-decode = tools.decode_tokens:main
+atomflow-dump-gt = tools.dump_ground_truth:main
+atomflow-export = tools.export_atomflow:main

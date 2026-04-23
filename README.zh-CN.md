@@ -86,7 +86,7 @@ cmake --build build -j --target atomflow-server-test
 - CUDA Toolkit ≥ 12.4
 - CMake ≥ 3.24
 - GCC ≥ 11（C++17）
-- GPU：Ada Lovelace（`sm_89`）或 Blackwell（`sm_120`）
+- GPU：Blackwell（`sm_120`）
 
 **快速开始**
 

@@ -1,0 +1,91 @@
+# ============================================================================
+# pyproject.toml — AtomFlow Python Tooling & CUDA Extension Packaging
+#
+# Modern PEP 621 packaging with setuptools_scm dynamic versioning,
+# CUDA build deps, and scanned tool dependencies.
+# ============================================================================
+
+# -- Build System -----------------------------------------------------------
+# Declares build-time dependencies required to compile CUDA extensions
+# and resolve dynamic versioning via setuptools_scm.
+[build-system]
+requires = [
+    "setuptools>=61",
+    "wheel",
+    "setuptools_scm>=6.0",
+    "torch>=2.1.0",
+]
+build-backend = "setuptools.build_meta"
+
+# -- Dynamic Versioning -----------------------------------------------------
+# setuptools_scm derives version from git tags/commits for full
+# reproducibility (bid compliance).
+[tool.setuptools_scm]
+write_to = "tools/_version.py"
+
+# -- Project Metadata ---------------------------------------------------------
+[project]
+name = "atomflow"
+dynamic = ["version"]
+description = "A linear-attention operator fusion engine optimised for NVIDIA Blackwell (SM120) architecture."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# -- Runtime Dependencies -----------------------------------------------------
+# Auto-scanned from tools/*.py + hard Infra requirements for operator
+# fusion (CuTe) and shared-memory management (TVM FFI).
+dependencies = [
+    # Scanned from tools/ Python scripts
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+    # Hard Infra deps for operator fusion & shared-memory scheduling
+    "nvidia-cutlass-dsl",
+    "apache-tvm-ffi",
+]
+
+[project.optional-dependencies]
+# Export + ground-truth generation + token decoding require the
+# HuggingFace stack and local tokenizer files.
+dev = [
+    "transformers>=4.35.0",
+    "huggingface-hub>=0.19.0",
+]
+
+# -- CLI Entry Points ---------------------------------------------------------
+# Register all critical tools in tools/ as first-class console scripts.
+[project.scripts]
+atomflow-export    = "tools.export_atomflow:main"
+atomflow-dump-gt   = "tools.dump_ground_truth:main"
+atomflow-decode    = "tools.decode_tokens:main"
+
+# -- Package Discovery --------------------------------------------------------
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tools*"]
+
+# -- Code Quality -------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

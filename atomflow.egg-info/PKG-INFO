@@ -1,3 +1,27 @@
+Metadata-Version: 2.4
+Name: atomflow
+Version: 0.1.0
+Summary: Bare-metal CUDA C++ LLM inference engine with Python tooling
+License: MIT
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: C++
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: tqdm>=4.65.0
+Provides-Extra: dev
+Requires-Dist: transformers>=4.35.0; extra == "dev"
+Requires-Dist: huggingface-hub>=0.19.0; extra == "dev"
+
 # AtomFlow
 
 **A Bare-Metal, Zero-Overhead LLM Inference Engine for Consumer GPUs**
@@ -86,7 +110,7 @@ cmake --build build -j --target atomflow-server-test
 - CUDA Toolkit ≥ 12.4
 - CMake ≥ 3.24
 - GCC ≥ 11 (C++17)
-- GPU: Blackwell (`sm_120`)
+- GPU: Ada Lovelace (`sm_89`) or Blackwell (`sm_120`)
 
 **Quick start**
 
