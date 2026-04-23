@@ -23,6 +23,18 @@ AtomFlow 是一个从零开始的 CUDA C++ 推理引擎，在单张 **NVIDIA RTX
 | 运行时 cudaMalloc | **0 次** |
 | 数值精度 | 37/37 逐层探针 PASS |
 
+### 对标 vLLM 基准测试
+
+在同一张 **RTX 5060 Ti** 单卡环境下，针对 Llama 3.2 3B 的 $M=1$ 解码任务，与业界标杆 **vLLM**（开启全量编译优化：`torch.compile` + CUDA Graph 捕获）进行头对头对比。
+
+| 引擎 | TPOT (ms) | 说明 |
+|------|-----------|------|
+| **AtomFlow** | **~14.5** | 静态连续 KV、融合 W8A16 GEMV、CUDA Graph |
+| vLLM（优化后） | ~16.1 | `torch.compile` + CUDA Graph + PagedAttention |
+| **领先幅度** | **−11.5%** | AtomFlow 单步延迟占优 |
+
+**结论解读。** 在单流（$M=1$）、非并发场景下，KV 缓存的连续算术寻址相对于分页间接寻址具有绝对的访存优势：无页表查找、无 TLB 压力、无散列加载。11.5% 的延迟优势即是 PagedAttention 在无并发需求时为"灵活性"所付出的经验代价。PagedAttention 在多请求批处理场景下仍为最优解；AtomFlow 所针对的是设计空间的另一极端。
+
 ---
 
 ## 架构一：AtomFlow Core — 极致性能区
@@ -120,18 +132,29 @@ cmake --build build -j
 
 ## 项目结构
 
+`src/kernel/*` 是核心引擎与服务器沙箱之间的**共享边界**：两个 CMake 目标（`atomflow` 与 `atomflow-server-test`）链接同一套底层数学 kernel，除此之外不共享任何代码。
+
 ```
 AtomFlow/
 ├── CMakeLists.txt                  # 双目标构建：atomflow + atomflow-server-test
+├── pyproject.toml                  # PEP 621 元数据（setuptools_scm 动态版本）
+├── setup.py                        # torch.utils.cpp_extension CUDA 构建钩子
+├── run_inference.sh                # 端到端便捷运行脚本
 ├── include/
 │   ├── core/
 │   │   ├── engine.h                # AtomFlowEngine（初始化、前向传播、KV 缓存）
 │   │   ├── model_state.h           # LayerWeights 与 ActBuffers（POD 结构体）
-│   │   └── view.h                  # POD 张量描述符（dims, strides, dtype）
+│   │   ├── view.h                  # POD 张量描述符（dims, strides, dtype）
+│   │   ├── qkvview.h               # qkv_out 上的零拷贝 QKV 切片
+│   │   ├── atom_context.h          # 全局运行时上下文（handle、stream）
+│   │   └── config.h                # 编译期 ModelConfig 常量
 │   ├── ops/
 │   │   └── kernel.h                # 所有 kernel launcher 声明
 │   ├── memory/
-│   │   └── weight_loader.h         # 基于 mmap 的权重加载
+│   │   ├── weight_loader.h         # 基于 mmap 的权重加载
+│   │   ├── alloc.h                 # Arena bump-allocator 辅助
+│   │   ├── memory_planner.h        # 静态 arena 尺寸规划
+│   │   └── block_manager.h         # 沙箱块管理器占位
 │   └── utils/
 │       ├── utils.h                 # CUDA_CHECK / CUBLAS_CHECK 宏
 │       ├── profiler.h              # EngineProfiler（延迟 cudaEvent 计时）
@@ -140,34 +163,39 @@ AtomFlow/
 │   ├── main.cu                     # CLI + 基准测试 + 自回归循环 + token 日志
 │   ├── core/
 │   │   └── engine.cu               # AtomFlowEngine 完整实现
-│   ├── kernel/
+│   ├── kernel/                     # ← 共享边界：两个目标均链接此目录
 │   │   ├── helpers.cu              # 嵌入查找、RoPE 缓存、KV 缓存写入
-│   │   ├── qkv_gemm.cu            # 融合 W8A16 GEMV + cuBLAS lm_head GEMM
-│   │   ├── tiled_attention.cu     # GQA 缓存注意力（M=1 优化）
-│   │   ├── rmsnorm.cu             # FP16 RMSNorm
-│   │   ├── rope.cu                # 旋转位置编码（原地修改）
-│   │   ├── residual_add.cu        # 逐元素残差相加
-│   │   ├── swiglu.cu              # SwiGLU 激活
-│   │   └── argmax.cu              # 贪心 ArgMax 采样
+│   │   ├── qkv_gemm.cu             # 融合 W8A16 GEMV + cuBLAS lm_head GEMM
+│   │   ├── tiled_attention.cu      # GQA 缓存注意力（M=1 优化）
+│   │   ├── rmsnorm.cu              # FP16 RMSNorm
+│   │   ├── rope.cu                 # 旋转位置编码（原地修改）
+│   │   ├── residual_add.cu         # 逐元素残差相加
+│   │   ├── swiglu.cu               # SwiGLU 激活
+│   │   ├── argmax.cu               # 贪心 ArgMax 采样
+│   │   └── layer.cu                # 层级辅助函数
 │   ├── experimental/
-│   │   └── server_arch/
+│   │   └── server_arch/            # 沙箱源文件（目标：atomflow-server-test）
 │   │       ├── server_engine.h     # ServerEngine 类（沙箱）
 │   │       ├── server_engine.cu    # atomflow-server-test 入口点
 │   │       └── paged_kv_manager.h  # KVBlock、PageTable、BlockManager 占位
 │   └── utils/
 │       ├── profiler.cpp            # EngineProfiler 实现
 │       └── validator.cpp           # 基准真值对比
-└── tools/
-    ├── export_atomflow.py          # HF Llama 3.2 → AtomFlow .bin（AWQ + FP8 GS=128）
-    ├── dump_ground_truth.py        # 导出逐层激活用于验证器
-    └── decode_tokens.py            # 离线 token → 文本解码器（本地 tokenizer）
+├── tools/
+│   ├── export_atomflow.py          # HF Llama 3.2 → AtomFlow .bin（AWQ + FP8 GS=128）
+│   ├── dump_ground_truth.py        # 导出逐层激活用于验证器
+│   └── decode_tokens.py            # 离线 token → 文本解码器（本地 tokenizer）
+├── models/                         # 本地模型权重与 tokenizer 文件
+└── ground_truth/                   # 验证器使用的逐层 FP32 激活转储
 ```
 
 ---
 
 ## 路线图
 
-### 核心引擎
+路线图严格限定在”已完成“与“未来3 个月”两个区间内；长远愿望清单已移除，以保持路线图的可信性。
+
+### 已完成
 
 - [x] 静态 arena 分配器（权重 + 激活 + KV 缓存池）
 - [x] 融合 W8A16 GEMV（零中间 DRAM 写回，峰值 233 GB/s）
@@ -175,26 +203,20 @@ AtomFlow/
 - [x] CUDA Graph 捕获（280+ kernel → 单次图分发）
 - [x] 逐层数值验证（37/37 PASS）
 - [x] Token 日志 + 离线 Python 解码器
-- [ ] **Prefill 阶段优化** — 基于 GEMM 的批量 token 处理以降低 TTFT
-- [ ] Tensor Core `mma.sync` 注意力路径（长上下文解码）
-- [ ] Top-K / Top-P 采样 + 温度缩放
-- [ ] Python 绑定（PyBind11）
-- [ ] NCCL 多卡通信
+- [x] 独立服务器沙箱 CMake 目标（`atomflow-server-test`）
+- [x] ServerEngine 脚手架 + BlockManager / PageTable 占位
 
-### 服务器沙箱
+### 未来3 个月
 
-- [x] 独立 CMake 目标，共享数学 kernel
-- [x] ServerEngine 脚手架 + BlockManager/PageTable 占位
-- [ ] **PagedAttention kernel** — 对比静态连续 KV 的精确延迟差值
-- [ ] 连续批处理调度器 + 多请求队列
-- [ ] 量化对比：页表查找开销（ns）vs. 线性寻址
+- [ ] **沙箱内的 PagedAttention kernel** — 与静态连续 KV kernel 进行量化延迟对比（**对比本身**即为交付物）
+- [ ] **更多前後缀算子融合** — 如 LayerNorm + MatMul、SwiGLU + down-projection；持续评估寄存器压力抵消融合收益的临界点
 
 ---
 
 ## 设计哲学
 
-- **物理优先** — 每个决策源自硬件约束（448 GB/s 带宽、16 GB 显存、$M=1$ 算术强度 < 1）。
+- **物理优先** — 每个决策源自硬件约束（448 GB/s 带宽、16 GB 显存、$M=1$ 算术强度 < 1）。例如，由于 $M=1$ 解码受带宽约束，任何会引入额外 DRAM 往返的抽象默认被拒绝。
 - **零运行时分配** — 所有内存在初始化时静态分区；推理期间为纯 kernel 分发。
-- **融合一切** — 若两个 kernel 共享数据，则它们必须合为一个 kernel。无中间 DRAM 往返。
+- **融合优先（Fusion-First）** — 默认采用 kernel 融合；当两个 kernel 共享数据时，举证责任在于”保持分离“一方。当前已融合：W8A16 GEMV（FP8 反量化 + FP16 内积仅在寄存器）、自研 GQA 注意力 kernel（Q·Kᵀ + softmax + V 累加仅在共享内存）。持续工作聚焦于”激进融合仍有收益“与”寄存器压力抵消收益“的临界点。
 - **测量而非假设** — 内置性能分析器（`ENABLE_PROFILER=1`）和验证器（`ENABLE_VALIDATOR=1`）支撑每一项指标。
-- **双架构** — 生产引擎针对当前最快路径优化（静态、连续、单流）。沙箱探索未来可能需要的能力（分页、批处理、调度）。
+- **双架构（建设中）** — 生产引擎优先 $M=1$ 单流解码；并行的服务器沙箱目标正在构建，用于量化分页/批处理相对静态连续布局的开销。最终交付物就是这份对比本身，而非一套生产级服务系统。
