@@ -93,18 +93,34 @@ cmake --build build -j --target atomflow-server-test
 
 ## 构建与运行
 
-**环境要求**
+**依赖**
 
 - CUDA Toolkit ≥ 12.4
 - CMake ≥ 3.24
 - GCC ≥ 11（C++17）
 - GPU：Blackwell（`sm_120`）
+- Python ≥ 3.10（**仅标准库** — 无需 torch、transformers、vllm）
 
-**快速开始**
+### 一键评估（面向评审）
 
 ```bash
 git clone https://github.com/altersieg/AtomFlow.git
 cd AtomFlow
+bash scripts/bootstrap.sh
+# （如需覆盖 HF 源仓库，可先执行：
+#  export ATOMFLOW_HF_REPO="Altersieg/test4AtomFlow"）
+```
+
+脚本会按序执行：工具链检查 → `cmake --build` → 从 HuggingFace 仓库下载预导出的
+`.bin` + tokenizer（支持断点续传 + SHA-256 校验）→ 运行 `atomflow-eval`
+（现场测 AtomFlow TPOT，对比硬编码的 vLLM baseline，实时计算加速比）。
+
+选项：`--skip-build` 复用已有 `build/atomflow`；`--skip-fetch` 信任已有
+`models/` 目录。
+
+### 手动构建
+
+```bash
 cmake -S . -B build
 cmake --build build -j
 

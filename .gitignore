@@ -14,11 +14,30 @@ compile_commands.json
 *.pth
 *.safetensors
 models/weights/
+models/Llama-3.2-3B-Instruct/
+ground_truth/*.bin
+
+# runtime outputs
+output_tokens.txt
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env/
+tools/_version.py
 
 # IDE
 .vscode/
 .idea/
 .DS_Store
+
+# paper artifacts (kept local, not tracked)
+paper.md
+paper.tex
+*.docx
 
 # profiling
 *.nsys-rep

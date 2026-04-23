@@ -99,12 +99,29 @@ cmake --build build -j --target atomflow-server-test
 - CMake ≥ 3.24
 - GCC ≥ 11 (C++17)
 - GPU: Blackwell (`sm_120`)
+- Python ≥ 3.10 (standard library only — no torch, no transformers, no vllm)
 
-**Quick start**
+### One-Click Evaluation (reviewers)
 
 ```bash
 git clone https://github.com/altersieg/AtomFlow.git
 cd AtomFlow
+bash scripts/bootstrap.sh
+# (override the HF source repo if needed:
+#  export ATOMFLOW_HF_REPO="Altersieg/test4AtomFlow")
+```
+
+The script performs, in order: toolchain check → `cmake --build` → download
+pre-exported `.bin` + tokenizer from the HuggingFace repo (resumable, SHA-256
+verified) → run `atomflow-eval` (live AtomFlow TPOT vs. hardcoded vLLM
+baseline, with speedup computed on-the-fly).
+
+Flags: `--skip-build` reuses `build/atomflow`; `--skip-fetch` trusts existing
+`models/`.
+
+### Manual build
+
+```bash
 cmake -S . -B build
 cmake --build build -j
 

@@ -46,24 +46,35 @@ classifiers = [
 ]
 
 # -- Runtime Dependencies -----------------------------------------------------
-# Auto-scanned from tools/*.py + hard Infra requirements for operator
-# fusion (CuTe) and shared-memory management (TVM FFI).
-dependencies = [
-    # Scanned from tools/ Python scripts
+# Core install is intentionally dependency-free:
+#   - atomflow-eval  uses only the Python standard library
+#   - atomflow-fetch uses only urllib.request (stdlib) to pull weights
+# Reviewers running the one-click evaluation do NOT need torch, vllm,
+# transformers, or any ML framework.
+dependencies = []
+
+[project.optional-dependencies]
+# [export]  Full weight-export pipeline (HF Llama 3.2 -> AtomFlow .bin).
+#           Only needed by project authors regenerating the .bin, not by
+#           reviewers evaluating the produced binary.
+export = [
     "torch>=2.1.0",
     "numpy>=1.24.0",
     "tqdm>=4.65.0",
-    # Hard Infra deps for operator fusion & shared-memory scheduling
+    "transformers>=4.35.0",
+    "huggingface-hub>=0.19.0",
+]
+
+# [infra]   Operator-fusion / shared-memory research libs (optional).
+infra = [
     "nvidia-cutlass-dsl",
     "apache-tvm-ffi",
 ]
 
-[project.optional-dependencies]
-# Export + ground-truth generation + token decoding require the
-# HuggingFace stack and local tokenizer files.
+# [dev]     Everything above + lint tooling.
 dev = [
-    "transformers>=4.35.0",
-    "huggingface-hub>=0.19.0",
+    "atomflow[export,infra]",
+    "ruff>=0.4.0",
 ]
 
 # -- CLI Entry Points ---------------------------------------------------------
@@ -72,6 +83,8 @@ dev = [
 atomflow-export    = "tools.export_atomflow:main"
 atomflow-dump-gt   = "tools.dump_ground_truth:main"
 atomflow-decode    = "tools.decode_tokens:main"
+atomflow-eval      = "tools.eval_comparison:main"
+atomflow-fetch     = "tools.fetch_weights:main"
 
 # -- Package Discovery --------------------------------------------------------
 [tool.setuptools]
