@@ -21,7 +21,8 @@ models/Llama-3.2-3B-Instruct/
 
 # runtime outputs
 output_tokens.txt
-results/
+# local-only artefact cache: vLLM baseline JSON, token snapshots, etc.
+tools/artifacts/
 
 # Python
 __pycache__/

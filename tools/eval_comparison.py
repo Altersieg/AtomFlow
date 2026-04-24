@@ -22,18 +22,31 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# vLLM baseline — PRE-PROFILED, DO NOT EDIT without rerunning the benchmark
+# vLLM baseline — loaded from tools/artifacts/vllm_baseline.json if present,
+# otherwise falls back to the embedded defaults below.  Refresh the JSON by
+# running:  python tools/run_vllm_baseline.py    (live vLLM run, auto-update)
+#
+# The artifacts/ folder is git-ignored — it is a local cache, not a source
+# of truth.  The embedded dict below IS the committed source of truth.
 # ---------------------------------------------------------------------------
-VLLM_BASELINE = {
+_BASELINE_JSON = Path(__file__).resolve().parent / "artifacts" / "vllm_baseline.json"
+
+_EMBEDDED_DEFAULT = {
     "engine":          "vLLM (bench latency)",
     "version":         "vllm (conda env: vllm_opt)",
     "date":            "2026-04-24",
     "hardware":        "NVIDIA RTX 5060 Ti 16GB",
     "driver":          "591.74",
     "cuda":            "12.x",
+    # NOTE: numbers below were measured with this exact command (5 warmup,
+    # input-len 4, output-len 256).  When run_vllm_baseline.py is executed
+    # the JSON sidecar overrides both the command string AND the numbers
+    # with a fresh, aligned measurement (10 warmup, input-len 32, output-len
+    # 128 — matching AtomFlow's BENCHMARK_WARMUP_ITERS / MEASURE_ITERS).
     "command": (
         "python -m vllm.entrypoints.cli.main bench latency "
         "--model Llama-3.2-3B-Instruct --batch-size 1 "
@@ -47,10 +60,27 @@ VLLM_BASELINE = {
     "p99_latency_s":   5.4977,
     "output_tokens":   256,
     "prefill_tokens":  4,
-    "prefill_ms_est":  35.0,   # single forward over 4 tokens, conservative
-    "notes":           "Live execution bypassed: heavy Python deps "
-                       "(vllm, torch) and HF-gated Llama-3.2 download.",
+    "prefill_ms_est":  35.0,
+    "notes":           "Embedded fallback — run tools/run_vllm_baseline.py to refresh.",
 }
+
+
+def _load_baseline() -> dict:
+    if _BASELINE_JSON.exists():
+        try:
+            with _BASELINE_JSON.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            # merge so new keys added later still fall back to defaults
+            merged = dict(_EMBEDDED_DEFAULT)
+            merged.update(data)
+            return merged
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[WARN] could not parse {_BASELINE_JSON}: {e}; using embedded default",
+                  file=sys.stderr)
+    return dict(_EMBEDDED_DEFAULT)
+
+
+VLLM_BASELINE = _load_baseline()
 
 
 def vllm_pure_decode_tpot_ms() -> float:

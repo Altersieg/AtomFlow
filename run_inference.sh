@@ -55,3 +55,18 @@ WALL_MS=$(( (END_NS - START_NS) / 1000000 ))
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "[DONE]  Wall-clock total: ${WALL_MS} ms"
 echo "        (includes weight upload, CUDA context init, and forward pass)"
+
+# ── 4. Archive the token output with a timestamp ────────────────────────────
+# The engine always writes to output_tokens.txt (hard-coded in main.cu).
+# We keep that file for decode_tokens.py, but ALSO snapshot it into
+# tools/artifacts/output_tokens_YYYYMMDD-HHMMSS.txt so repeated runs do not
+# overwrite each other's history.  tools/artifacts/ is git-ignored.
+TOKEN_FILE="${REPO_ROOT}/output_tokens.txt"
+if [[ -s "${TOKEN_FILE}" ]]; then
+    ARTIFACTS_DIR="${REPO_ROOT}/tools/artifacts"
+    mkdir -p "${ARTIFACTS_DIR}"
+    STAMP=$(date +"%Y%m%d-%H%M%S")
+    ARCHIVE="${ARTIFACTS_DIR}/output_tokens_${STAMP}.txt"
+    cp "${TOKEN_FILE}" "${ARCHIVE}"
+    echo "[SAVE]  Token snapshot → ${ARCHIVE#${REPO_ROOT}/}"
+fi

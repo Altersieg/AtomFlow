@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <string>
 #include <chrono>
+#include <vector>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 #include "core/engine.h"
@@ -24,8 +26,16 @@
 #endif
 
 // Warm-up iterations for benchmark mode / 基准测试模式的预热迭代次数
+//   10 matches common practice (vLLM uses 5-10) and is enough time for the
+//   GPU boost clock to stabilise (>150 ms of sustained work).
 #ifndef BENCHMARK_WARMUP_ITERS
-#define BENCHMARK_WARMUP_ITERS 3
+#define BENCHMARK_WARMUP_ITERS 10
+#endif
+
+// Timed iterations whose median we report.  Using median (not mean) makes the
+// reading robust to the occasional stutter from OS scheduling / driver GC.
+#ifndef BENCHMARK_MEASURE_ITERS
+#define BENCHMARK_MEASURE_ITERS 20
 #endif
 
 static constexpr const char* DEFAULT_WEIGHTS   = "models/llama3_2_atomflow.bin";
@@ -109,36 +119,53 @@ int main(int argc, char* argv[]) {
     }
     std::printf("[Graph]  Graph warm-up done.\n");
 
-    // ── 6. Timed run — graph replay / 计时运行 — Graph 重放 ─────────────
-    engine.inject_input(GT_EMBED_PATH, /*verbose=*/false);
-    CUDA_CHECK(cudaDeviceSynchronize());  // drain pipeline before timing
+    // ◭─ 6. Timed runs — median of N iterations / 计时运行 — 取 N 次迭代的中位数 ───
+    // Helper lambda that times a single trial and returns milliseconds.
+    // 辅助 lambda：测一次 trial 并返回毫秒数。
+    auto time_once = [&](auto &&launch) -> double {
+        engine.inject_input(GT_EMBED_PATH, /*verbose=*/false);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto s = std::chrono::steady_clock::now();
+        launch();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto e = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(e - s).count();
+    };
 
-    auto t_start = std::chrono::steady_clock::now();
-    CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    auto t_end = std::chrono::steady_clock::now();
+    auto median_of = [&](std::vector<double>& v) -> double {
+        const size_t mid = v.size() / 2;
+        std::nth_element(v.begin(), v.begin() + mid, v.end());
+        return v[mid];
+    };
 
-    double graph_ms   = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    double graph_tps  = 1000.0 / graph_ms;
+    // Graph timings
+    std::vector<double> graph_times;
+    graph_times.reserve(BENCHMARK_MEASURE_ITERS);
+    for (int mi = 0; mi < BENCHMARK_MEASURE_ITERS; ++mi) {
+        graph_times.push_back(time_once([&]{
+            CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
+        }));
+    }
+    double graph_ms  = median_of(graph_times);
+    double graph_tps = 1000.0 / graph_ms;
 
-    // Also time a single eager pass for comparison.
-    // 同时计时一次普通前向传播用于对比。
-    engine.inject_input(GT_EMBED_PATH, /*verbose=*/false);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    auto t2_start = std::chrono::steady_clock::now();
-    engine.forward_pass();
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto t2_end = std::chrono::steady_clock::now();
-
-    double eager_ms   = std::chrono::duration<double, std::milli>(t2_end - t2_start).count();
-    double eager_tps  = 1000.0 / eager_ms;
+    // Eager timings
+    std::vector<double> eager_times;
+    eager_times.reserve(BENCHMARK_MEASURE_ITERS);
+    for (int mi = 0; mi < BENCHMARK_MEASURE_ITERS; ++mi) {
+        eager_times.push_back(time_once([&]{
+            engine.forward_pass();
+        }));
+    }
+    double eager_ms  = median_of(eager_times);
+    double eager_tps = 1000.0 / eager_ms;
 
     std::printf("\n");
     std::printf("╔══════════════════════════════════════════════════════════╗\n");
     std::printf("║  AtomFlow  ·  Pure GPU Benchmark                        ║\n");
     std::printf("╠══════════════════════════════════════════════════════════╣\n");
-    std::printf("║  Warm-up iterations:  %d                                ║\n", BENCHMARK_WARMUP_ITERS);
+    std::printf("║  Warm-up: %2d   Measured (median of): %2d              ║\n",
+                BENCHMARK_WARMUP_ITERS, BENCHMARK_MEASURE_ITERS);
     std::printf("║                                                          ║\n");
     std::printf("║  [Eager]  TPOT:  %8.3f ms  (%6.1f tok/s)            ║\n", eager_ms, eager_tps);
     std::printf("║  [Graph]  TPOT:  %8.3f ms  (%6.1f tok/s)            ║\n", graph_ms, graph_tps);
