@@ -15,7 +15,9 @@ compile_commands.json
 *.safetensors
 models/weights/
 models/Llama-3.2-3B-Instruct/
-ground_truth/*.bin
+# ground_truth/*.bin files are SMALL (~624 KB total) and required by the
+# binary at runtime, so we SHIP them with the repo — un-ignore here.
+!ground_truth/*.bin
 
 # runtime outputs
 output_tokens.txt
