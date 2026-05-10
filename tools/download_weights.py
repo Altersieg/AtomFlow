@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# tools/fetch_weights.py
+# tools/download_weights.py
 # ----------------------------------------------------------------------------
 # Downloads the AtomFlow pre-exported weight .bin and the Llama-3.2 tokenizer
 # directory from a public HuggingFace Hub repository, using only the Python
@@ -20,9 +20,9 @@
 #     export ATOMFLOW_HF_REPO="yourname/atomflow-llama3.2-3b"
 #
 # Usage:
-#     python3 tools/fetch_weights.py                # download all missing
-#     python3 tools/fetch_weights.py --force        # re-download all
-#     python3 tools/fetch_weights.py --verify       # only check SHA256
+#     python3 tools/download_weights.py                # download all missing
+#     python3 tools/download_weights.py --force        # re-download all
+#     python3 tools/download_weights.py --verify       # only check SHA256
 # ============================================================================
 
 from __future__ import annotations

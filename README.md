@@ -91,6 +91,46 @@ cmake --build build -j --target atomflow-server-test
 
 ---
 
+## Performance Analysis
+
+Systematic profiling with **Nsight Systems** (timeline) and **Nsight Compute** (per-kernel) reveals where time is spent and what limits throughput.
+
+### Kernel Time Breakdown (nsys, single forward pass)
+
+| Kernel | Time % | Count / fwd | Avg (μs) | Notes |
+|--------|--------|-------------|-----------|-------|
+| `w8a16_gemv_kernel` | 82.3% | 140 | 108.7 | 28 layers × 5 linear projections |
+| cuBLAS GEMV (lm\_head) | 12.2% | 1 | 2,253 | Vocab projection (128 256 × 3 072) |
+| `rms_norm_kernel` | 3.7% | 57 | 12.0 | 28 layers × 2 + final |
+| `rope_kernel` | 0.8% | 28 | 5.3 | |
+| `gqa_cached_attention` | 0.4% | 28 | 2.6 | |
+| `residual_add` + `swiglu` | 0.5% | 84 | ~1.0 | Scalar half loads (<50% BW) |
+
+Total GPU utilization: **93%** (7% idle gaps between kernel launches in eager mode, eliminated by CUDA Graph).
+
+### ncu Speed-of-Light — GEMV Kernel
+
+| Metric | Value | Interpretation |
+|--------|-------|----------------|
+| DRAM Throughput | **38.5%** of peak | Under-utilized — not enough load requests in flight |
+| SM Compute Throughput | **80.5%** of peak | ALU pipeline nearly saturated |
+| Achieved Occupancy | 93.7% | Not the bottleneck |
+| L1 Hit Rate | 68% | Activation vector reuse across blocks |
+| L2 Hit Rate | 3% | Expected — weight matrix ≫ L2 capacity |
+| Top stall: `long_scoreboard` | 3.13 | Warps waiting for global memory |
+| Top stall: `math_pipe_throttle` | 1.91 | **ALU back-pressure from FP8→float conversion** |
+
+**Root cause:** The FP8 E4M3 → float scalar conversion + multiply-accumulate chain generates ~24 ALU instructions per 3 load instructions (ratio 8:1). The SM saturates its ALU pipeline before the DRAM controller is fully utilised. This is an *instruction-throughput* bottleneck, not a classic memory-bandwidth bottleneck.
+
+### Identified Optimisation Targets
+
+1. **GEMV vectorised load width** — `LDG.32` → `LDG.128` (VEC 4 → 16) + hardware-accelerated FP8 bulk conversion to reduce ALU instruction count.
+2. **RMSNorm → GEMV prologue fusion** — eliminate 56 redundant DRAM round-trips per forward (RMSNorm writes `x_norm`, GEMV immediately re-reads it).
+3. **Residual-add vectorisation** — `float4` loads instead of scalar `half` (currently <50% memory bandwidth efficiency).
+4. **SwiGLU vectorisation** — same scalar-load issue as residual-add.
+
+---
+
 ## Build & Run
 
 **Requirements**
@@ -126,7 +166,7 @@ cmake -S . -B build
 cmake --build build -j
 
 ./build/atomflow                # benchmark + AR generation
-python tools/decode_tokens.py   # decode token IDs to text
+python tools/read_output.py     # decode token IDs to text
 ```
 
 **Validation mode** (compare every layer against HuggingFace ground truth):
@@ -199,9 +239,9 @@ AtomFlow/
 │       ├── profiler.cpp            # EngineProfiler implementation
 │       └── validator.cpp           # Ground-truth comparison
 ├── tools/
-│   ├── export_atomflow.py          # HF Llama 3.2 → AtomFlow .bin (AWQ + FP8 GS=128)
-│   ├── dump_ground_truth.py        # Per-layer activation dump for validator
-│   └── decode_tokens.py            # Offline token → text decoder (local tokenizer)
+│   ├── quantize_weights.py         # HF Llama 3.2 → AtomFlow .bin (AWQ + FP8 GS=128)
+│   ├── gen_ground_truth.py         # Per-layer activation dump for validator
+│   └── read_output.py              # Offline token → text decoder (local tokenizer)
 ├── models/                         # Local model weights + tokenizer files
 └── ground_truth/                   # Dumped per-layer FP32 activations for validator
 ```
@@ -223,10 +263,13 @@ Scope is deliberately narrow: items below are either shipped or on the 2–3 mon
 - [x] Isolated Server Sandbox CMake target (`atomflow-server-test`)
 - [x] ServerEngine scaffolding + BlockManager / PageTable stubs
 
-### Next (2–3 months)
+### Next (profiling-driven)
 
+- [ ] **GEMV LDG.128 + vector FP8 dequant** — widen VEC from 4 → 16, use hardware-accelerated FP8 bulk conversion; target ≥75% DRAM utilisation (currently 38.5%)
+- [ ] **Prefill path (M > 1)** — cuBLAS GEMM for prompt processing; prerequisite for speculative decoding
+- [ ] **RMSNorm + GEMV prologue fusion** — eliminate 56 redundant DRAM round-trips per forward pass
+- [ ] **Residual-add vectorisation + GEMV epilogue fusion** — `float4` loads (currently scalar `half`, <50% BW efficiency); fuse into GEMV write-back
 - [ ] **PagedAttention kernel in the sandbox** — quantitative latency comparison vs. the static contiguous KV kernel (the comparison itself is the deliverable)
-- [ ] **Additional prologue/epilogue fusions** — e.g. LayerNorm + MatMul, SwiGLU + down-projection; track the boundary where register pressure starts to negate fusion gains
 
 ---
 

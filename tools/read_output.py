@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-decode_tokens.py — Offline token decoder for AtomFlow engine output
-decode_tokens.py — AtomFlow 引擎输出的离线 token 解码器
+read_output.py — Offline token decoder for AtomFlow engine output
+read_output.py — AtomFlow 引擎输出的离线 token 解码器
 
 [EN] Reads integer token IDs from output_tokens.txt (one per line),
      loads the HuggingFace tokenizer for the target model, and prints
      the decoded human-readable text.
 
      Usage:
-       python tools/decode_tokens.py                          # default file
-       python tools/decode_tokens.py --file my_tokens.txt     # custom file
-       python tools/decode_tokens.py --model meta-llama/Llama-3.2-3B
+       python tools/read_output.py                          # default file
+       python tools/read_output.py --file my_tokens.txt     # custom file
+       python tools/read_output.py --model meta-llama/Llama-3.2-3B
 
 [CN] 从 output_tokens.txt 中读取整数 token ID（每行一个），
      加载目标模型的 HuggingFace tokenizer，并打印解码后的可读文本。
 
      用法：
-       python tools/decode_tokens.py                          # 默认文件
-       python tools/decode_tokens.py --file my_tokens.txt     # 自定义文件
-       python tools/decode_tokens.py --model meta-llama/Llama-3.2-3B
+       python tools/read_output.py                          # 默认文件
+       python tools/read_output.py --file my_tokens.txt     # 自定义文件
+       python tools/read_output.py --model meta-llama/Llama-3.2-3B
 """
 
 import argparse

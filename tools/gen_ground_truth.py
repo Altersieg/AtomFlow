@@ -1,5 +1,5 @@
 """
-dump_ground_truth.py
+gen_ground_truth.py
 Runs a fixed prompt through HuggingFace Llama 3.2 3B, captures intermediate
 activations via forward hooks, and saves them as raw FP32 binary files.
 
@@ -7,7 +7,7 @@ activations via forward hooks, and saves them as raw FP32 binary files.
 并将其保存为原始 FP32 二进制文件。
 
 Usage / 用法:
-    python tools/dump_ground_truth.py \
+    python tools/gen_ground_truth.py \
         --model_path /path/to/llama-3.2-3b \
         --output_dir ground_truth/
 
@@ -36,7 +36,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # that the C++ engine's exported weights came from.
 # 导入 AWQ 校准和平滑，使 GT 使用与 C++ 引擎导出权重相同的平滑模型。
 sys.path.insert(0, os.path.dirname(__file__))
-from export_atomflow import collect_activation_scales, apply_awq_smoothing
+from quantize_weights import collect_activation_scales, apply_awq_smoothing
 
 # Layers to instrument / 要插桩的层索引
 PROBE_LAYERS = [0, 13, 27]
@@ -83,11 +83,11 @@ def main():
     print(f"    Device: {args.device}  |  Num layers: {model.config.num_hidden_layers}")
 
     # -----------------------------------------------------------------------
-    # 1b. Apply AWQ smoothing (same transform as export_atomflow.py)
+    # 1b. Apply AWQ smoothing (same transform as quantize_weights.py)
     #     使 GT 模型与 C++ 引擎使用相同的平滑权重
     # -----------------------------------------------------------------------
     if not args.skip_awq:
-        print("[1b] Running AWQ calibration + smoothing (matches export_atomflow.py) ...")
+        print("[1b] Running AWQ calibration + smoothing (matches quantize_weights.py) ...")
         act_scales = collect_activation_scales(model, tokenizer, torch.device(args.device))
         apply_awq_smoothing(model, act_scales)
         print("     AWQ smoothing applied — GT model now matches exported weights.")

@@ -6,12 +6,11 @@
 #
 #   [1/5] toolchain check    (CUDA >= 12.4, driver >= 550, cmake, gcc, python)
 #   [2/5] GPU check          (Blackwell preferred; Ada/Ampere/Hopper fall back)
-#   [3/5] fetch weights      (python3 tools/fetch_weights.py — stdlib only)
+#   [3/5] fetch weights      (python3 tools/download_weights.py — stdlib only)
 #   [4/5] build              (cmake --build build -j)
 #   [5/5] run the demo       (./run_inference.sh — prints TPOT & tok/s)
 #
-# The whole pipeline has NO pip dependencies — fetch_weights.py and
-# eval_comparison.py are standard-library Python.
+# The whole pipeline has NO pip dependencies — download_weights.py is standard-library Python.
 #
 # Configure the HF repo containing the pre-exported weights via env var:
 #   export ATOMFLOW_HF_REPO="Altersieg/test4AtomFlow"   (default)
@@ -21,7 +20,6 @@
 #   bash scripts/bootstrap.sh --skip-build   # reuse existing ./build/atomflow
 #   bash scripts/bootstrap.sh --skip-fetch   # reuse existing ./models/
 #   bash scripts/bootstrap.sh --skip-run     # stop after build (CI mode)
-#   bash scripts/bootstrap.sh --with-eval    # also run vLLM comparison
 # ============================================================================
 
 set -euo pipefail
@@ -32,13 +30,11 @@ BUILD_DIR="${REPO_ROOT}/build"
 SKIP_BUILD=0
 SKIP_FETCH=0
 SKIP_RUN=0
-WITH_EVAL=0
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         --skip-fetch) SKIP_FETCH=1 ;;
         --skip-run)   SKIP_RUN=1   ;;
-        --with-eval)  WITH_EVAL=1  ;;
         -h|--help)
             sed -n '2,25p' "${BASH_SOURCE[0]}"
             exit 0
@@ -54,7 +50,7 @@ banner() { printf '\n%s━━━━━━━━━━━━━━━━━━━
 step()   { printf '\n%s[%s]%s %s\n' "$BOLD" "$1" "$RST" "$2"; }
 ok()     { printf '   %s✓%s %s\n' "$GRN" "$RST" "$1"; }
 warn()   { printf '   %s⚠%s %s\n' "$YLW" "$RST" "$1"; }
-die()    { printf '   %s✗%s %s\n\n   Hint: see REVIEWERS.md for a prerequisite checklist.\n' "$RED" "$RST" "$1"; exit 1; }
+die()    { printf '   %s✗%s %s\n' "$RED" "$RST" "$1"; exit 1; }
 
 # Numeric compare "a >= b" for X.Y version strings.
 vge() { printf '%s\n%s\n' "$2" "$1" | sort -CV; }
@@ -126,7 +122,7 @@ step "3/5" "Fetch weights (≈ 4.9 GiB)"
 if [[ $SKIP_FETCH -eq 1 ]]; then
     ok "--skip-fetch: trusting existing models/"
 else
-    python3 "${REPO_ROOT}/tools/fetch_weights.py"
+    python3 "${REPO_ROOT}/tools/download_weights.py"
 fi
 
 # Ground-truth input embeddings are shipped with the repo (~12 KB) —
@@ -156,12 +152,6 @@ if [[ $SKIP_RUN -eq 1 ]]; then
 else
     step "5/5" "Run demo (./run_inference.sh — prints TPOT and tok/s)"
     (cd "$REPO_ROOT" && ./run_inference.sh)
-fi
-
-# Optional — head-to-head against the pre-profiled vLLM baseline.
-if [[ $WITH_EVAL -eq 1 ]]; then
-    step "+" "vLLM comparison (pre-profiled baseline)"
-    python3 "${REPO_ROOT}/tools/eval_comparison.py"
 fi
 
 banner

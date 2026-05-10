@@ -91,6 +91,46 @@ cmake --build build -j --target atomflow-server-test
 
 ---
 
+## 性能分析
+
+通过 **Nsight Systems**（时间线级）和 **Nsight Compute**（单 kernel 级）系统性 profiling，定位时间消耗与吞吐瓶颈。
+
+### Kernel 耗时分布（nsys，单次 forward pass）
+
+| Kernel | 时间占比 | 每 forward 次数 | 平均耗时 (μs) | 说明 |
+|--------|---------|----------------|--------------|------|
+| `w8a16_gemv_kernel` | 82.3% | 140 | 108.7 | 28 层 × 5 个线性投影 |
+| cuBLAS GEMV (lm\_head) | 12.2% | 1 | 2,253 | 词表投影 (128 256 × 3 072) |
+| `rms_norm_kernel` | 3.7% | 57 | 12.0 | 28 层 × 2 + final |
+| `rope_kernel` | 0.8% | 28 | 5.3 | |
+| `gqa_cached_attention` | 0.4% | 28 | 2.6 | |
+| `residual_add` + `swiglu` | 0.5% | 84 | ~1.0 | 标量 half 加载（带宽利用率 <50%） |
+
+GPU 总利用率：**93%**（Eager 模式下 kernel 间有 7% 空闲间隙，CUDA Graph 消除后接近 0）。
+
+### ncu Speed-of-Light — GEMV Kernel
+
+| 指标 | 数值 | 解读 |
+|------|------|------|
+| DRAM 吞吐 | 峰值的 **38.5%** | 利用不足——在途 load 请求不够 |
+| SM 计算吞吐 | 峰值的 **80.5%** | ALU 流水线接近饱和 |
+| 实际 Occupancy | 93.7% | 非瓶颈 |
+| L1 命中率 | 68% | 激活向量跨 block 复用 |
+| L2 命中率 | 3% | 符合预期——权重矩阵远大于 L2 容量 |
+| 主要 stall：`long_scoreboard` | 3.13 | Warp 等待全局内存返回 |
+| 主要 stall：`math_pipe_throttle` | 1.91 | **FP8→float 转换导致 ALU 反压** |
+
+**根因：** FP8 E4M3 → float 标量转换 + 乘累加链每 3 条 load 指令生成 ~24 条 ALU 指令（比例 8:1）。SM 在 DRAM 控制器充分利用之前已先饱和 ALU 流水线。这是*指令吞吐*瓶颈，而非经典的显存带宽瓶颈。
+
+### 已识别的优化方向
+
+1. **GEMV 向量化加载宽度** — `LDG.32` → `LDG.128`（VEC 4 → 16）+ 硬件加速 FP8 批量转换，减少 ALU 指令数。
+2. **RMSNorm → GEMV 前缀融合** — 消除每次 forward 56 次冗余 DRAM 往返（RMSNorm 写 `x_norm`，GEMV 立刻重新读取）。
+3. **Residual-add 向量化** — 用 `float4` 加载替代标量 `half`（当前带宽利用率 <50%）。
+4. **SwiGLU 向量化** — 与 residual-add 相同的标量加载问题。
+
+---
+
 ## 构建与运行
 
 **依赖**
@@ -125,7 +165,7 @@ cmake -S . -B build
 cmake --build build -j
 
 ./build/atomflow                # 基准测试 + 自回归生成
-python tools/decode_tokens.py   # 将 token ID 解码为文本
+python tools/read_output.py     # 将 token ID 解码为文本
 ```
 
 **验证模式**（逐层对比 HuggingFace 基准真值）：
@@ -198,9 +238,9 @@ AtomFlow/
 │       ├── profiler.cpp            # EngineProfiler 实现
 │       └── validator.cpp           # 基准真值对比
 ├── tools/
-│   ├── export_atomflow.py          # HF Llama 3.2 → AtomFlow .bin（AWQ + FP8 GS=128）
-│   ├── dump_ground_truth.py        # 导出逐层激活用于验证器
-│   └── decode_tokens.py            # 离线 token → 文本解码器（本地 tokenizer）
+│   ├── quantize_weights.py         # HF Llama 3.2 → AtomFlow .bin（AWQ + FP8 GS=128）
+│   ├── gen_ground_truth.py         # 导出逐层激活用于验证器
+│   └── read_output.py              # 离线 token → 文本解码器（本地 tokenizer）
 ├── models/                         # 本地模型权重与 tokenizer 文件
 └── ground_truth/                   # 验证器使用的逐层 FP32 激活转储
 ```
@@ -222,10 +262,13 @@ AtomFlow/
 - [x] 独立服务器沙箱 CMake 目标（`atomflow-server-test`）
 - [x] ServerEngine 脚手架 + BlockManager / PageTable 占位
 
-### 未来3 个月
+### 下一步（Profiling 驱动）
 
+- [ ] **GEMV LDG.128 + 向量化 FP8 反量化** — 将 VEC 从 4 拓宽至 16，使用硬件加速 FP8 批量转换；目标 DRAM 利用率 ≥75%（当前 38.5%）
+- [ ] **Prefill 路径（M > 1）** — 使用 cuBLAS GEMM 处理 prompt；投机解码的前置依赖
+- [ ] **RMSNorm + GEMV 前缀融合** — 消除每次 forward pass 56 次冗余 DRAM 往返
+- [ ] **Residual-add 向量化 + GEMV 尾缀融合** — `float4` 加载（当前标量 `half`，带宽利用率 <50%）；融入 GEMV 写回阶段
 - [ ] **沙箱内的 PagedAttention kernel** — 与静态连续 KV kernel 进行量化延迟对比（**对比本身**即为交付物）
-- [ ] **更多前後缀算子融合** — 如 LayerNorm + MatMul、SwiGLU + down-projection；持续评估寄存器压力抵消融合收益的临界点
 
 ---
 

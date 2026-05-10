@@ -58,7 +58,7 @@ echo "        (includes weight upload, CUDA context init, and forward pass)"
 
 # ── 4. Archive the token output with a timestamp ────────────────────────────
 # The engine always writes to output_tokens.txt (hard-coded in main.cu).
-# We keep that file for decode_tokens.py, but ALSO snapshot it into
+# We keep that file for read_output.py, but ALSO snapshot it into
 # tools/artifacts/output_tokens_YYYYMMDD-HHMMSS.txt so repeated runs do not
 # overwrite each other's history.  tools/artifacts/ is git-ignored.
 TOKEN_FILE="${REPO_ROOT}/output_tokens.txt"
